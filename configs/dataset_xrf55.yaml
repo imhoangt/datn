@@ -1,0 +1,87 @@
+# configs/dataset_xrf55.yaml
+# XRF55 dataset: Intel 5300 NIC, 30 subcarrier groups, ~200Hz
+# Paper: "XRF55: A Radio Frequency Dataset for Human Activity Recognition"
+# Override keys from base.yaml
+
+dataset:
+  name: xrf55
+  raw_dir: data/raw/xrf55
+  processed_dir: data/processed/xrf55
+
+  # Hardware
+  hardware: Intel5300          # Intel Wi-Fi Link 5300 (linux-80211n-csitool)
+  csi_tool: linux_csi_tool
+  freq_ghz: 5.0
+  bandwidth_mhz: 20
+  fs_nominal: 200.0            # ~200 packets/sec
+  n_subcarriers_raw: 30        # Intel 5300: 30 subcarrier groups at 20MHz
+  n_antennas_raw: 3            # Intel 5300: 3 receive antennas
+  n_receivers_raw: 3
+  n_subjects: 39
+  duration_s: -1               # variable length recordings
+
+  # Subcarrier normalization: keep native 30 (no padding)
+  sub_strategy: none
+  # Fisher selection divides 30 subs into 13 groups via np.array_split
+  # → 4 groups of 3 + 9 groups of 2; selects best 1 per group = 13 total.
+
+  # Antenna normalization: 3 → 4 (zero-pad column)
+  ant_strategy: pad_zeros
+
+  # Class mapping: XRF55 activity names → our 8 target classes
+  # Keys are lowercase XRF55 class names; values are target label ints (0-7)
+  class_mapping:
+    "walking"       : 0    # walk
+    "walk"          : 0
+    "running"       : 1    # run
+    "run"           : 1
+    "jogging"       : 1
+    "standing up"   : 2    # stand_up
+    "standup"       : 2
+    "stand up"      : 2
+    "rising"        : 2
+    "sitting down"  : 3    # sit_down
+    "sitdown"       : 3
+    "sit down"      : 3
+    "picking up"    : 4    # bend (cúi nhặt đồ)
+    "pickup"        : 4
+    "pick up"       : 4
+    "bending"       : 4
+    "falling down"  : 5    # fall
+    "falling"       : 5
+    "fall"          : 5
+    "fallen"        : 5
+    "fall down"     : 5
+    "lying down"    : 6    # lying_still
+    "lying"         : 6
+    "lie down"      : 6
+    "sleeping"      : 6
+    "lying still"   : 6
+    "no person"     : 7    # empty
+    "empty"         : 7
+    "background"    : 7
+    "no one"        : 7
+
+  class_names:
+    - walk          # 0
+    - run           # 1
+    - stand_up      # 2
+    - sit_down      # 3
+    - bend          # 4
+    - fall          # 5
+    - lying_still   # 6
+    - empty         # 7
+
+  # Expected file structure:
+  # data/raw/xrf55/{activity_name}/{subject_id}_{trial_id}.npy
+  # or data/raw/xrf55/{activity_name}/{subject_id}_{trial_id}.mat
+  # Array shape in file: (T × 1 × M × A × F) or (T × M × A × F) or (T × F × M × A)
+
+# Model override: AmpStem uses F_sub=30 (instead of base.yaml default 52)
+model:
+  F_sub: 30
+
+# LOSO over 39 subjects
+evaluation:
+  n_folds: 8    # use first 8 subjects for LOSO (matching own-data protocol)
+  # To use all 39: set n_folds: 39 (much slower)

@@ -1,0 +1,130 @@
+# configs/base.yaml
+# Shared defaults for ALL datasets.
+# Dataset-specific configs override these values.
+
+model:
+  D: 80                  # embedding dimension
+  A: 4                   # antennas per receiver (all datasets normalized to 4)
+  F_sub: 52              # subcarriers (all datasets normalized to 52)
+  T_window: 350          # time steps per window (1s at 350Hz)
+  T_dfs: 28              # DFS time frames after STFT: (350-128)//8+1 = 28
+  V_dfs: 128             # DFS frequency bins (nfft=128, two-sided)
+  M: 3                   # number of receivers (all datasets normalized to 3)
+  n_classes: 8
+  n_heads: 4
+  ffn_ratio: 2
+  dropout: 0.1
+  use_checkpoint: true   # gradient checkpointing (saves VRAM during training)
+
+preprocessing:
+  fs_out: 350.0          # target sampling rate (Hz) — all datasets resampled to this
+  n_subcarriers: 52      # target subcarrier count after selection/padding
+  n_receivers: 3         # target receiver count after padding
+  n_antennas: 4          # target antenna count after padding
+  T_window: 350          # window length (samples)
+  stride: 175            # window stride (50% overlap → ~9 windows per 5s recording)
+  ref_rx: 0              # reference RX index for B3 timestamp alignment
+
+  # B2 Hampel outlier detection
+  hampel_half: 7         # half-window size (15 packets total)
+  hampel_k: 3.0          # k×1.4826×MAD threshold
+
+  # B3 multi-RX timestamp alignment
+  align_threshold_s: 0.5 # max allowed lag before recording rejected
+  align_warn_s: 0.1      # lag above this triggers warning
+
+  # A2 packet validation
+  packet_loss_max: 0.15  # max fraction of missing packets before reject
+  min_packets: 300       # minimum valid packets per segment
+
+  # A4 IPI gap detection
+  gap_large_ms: 100.0    # gap > 100ms → split recording
+  gap_medium_ms: 30.0    # gap > 30ms  → flag for PCHIP repair
+  gap_small_factor: 3.0  # gap > 3×median_IPI → flag
+
+  # AGC
+  agc_noise_floor_ratio: 0.001  # noise floor = max_gain × ratio
+
+  # Branch α (Amplitude)
+  lp_cutoff: 30.0        # low-pass cutoff (Hz) — fall/run amplitude up to ~25Hz
+  lp_order: 4            # Butterworth order
+
+  # Branch β (DFS)
+  bp_low: 0.5            # bandpass low cutoff (Hz) — removes DC + breathing < 0.5Hz
+  bp_high: 80.0          # bandpass high cutoff (Hz) — covers run~70Hz, fall~47Hz
+  bp_order: 4            # Butterworth order (effective 8th-order for bandpass)
+
+  # STFT parameters (Branch β G6)
+  stft_nperseg: 128      # STFT window length → freq_res = 350/128 = 2.73 Hz/bin
+  stft_hop: 8            # hop = nperseg - noverlap → T_dfs = (350-128)//8+1 = 28 ✓
+  stft_nfft: 128         # FFT size (two-sided → 128 bins = ±175 Hz)
+
+  # Fisher subcarrier selection (Stats Pass 1, G5)
+  # n_fisher_groups groups are divided via np.array_split → sizes may differ
+  # when F % n_fisher_groups != 0 (e.g. XRF55 F=30: 4 groups×3 + 9 groups×2)
+  n_fisher_groups: 13
+
+training:
+  batch_size: 16
+  grad_accum: 4          # effective batch = 16×4 = 64
+  max_grad_norm: 1.0     # gradient clipping
+
+  # AdamW optimizer
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+  # Phase 1: Warmup (5 epochs, LR 1e-5 → 1e-4 linear)
+  warmup_epochs: 5
+  warmup_lr_start: 1.0e-5
+  warmup_lr_end: 1.0e-4
+
+  # Phase 2: Main cosine (50 epochs, 1e-4 → 1e-6)
+  main_epochs: 50
+  main_lr_start: 1.0e-4
+  main_lr_end: 1.0e-6
+
+  # Phase 3: Fine-tune cosine (20 epochs, 1e-5 → 1e-7)
+  finetune_epochs: 20
+  finetune_lr_start: 1.0e-5
+  finetune_lr_end: 1.0e-7
+
+  # EMA
+  ema_decay_main: 0.999      # Phase 1+2
+  ema_decay_finetune: 0.9999 # Phase 3
+
+  # Loss weights
+  label_smoothing: 0.05
+  focal_gamma: 2.0
+  w_aux: 0.3             # weight for auxiliary losses (L_occ + L_dyn + L_act)
+  w_cons: 0.05           # weight for receiver consistency loss
+  w_aux_ramp_epochs: 5   # ramp w_aux from 0→1 over first 5 epochs
+
+  # Class weights [walk, run, stand_up, sit_down, bend, fall, lying_still, empty]
+  # fall=2.0 (safety-critical), lying_still=1.5 (hard boundary), empty=3.0 (no rule-gate)
+  class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.5, 3.0]
+
+  # H1b CutMix-Time augmentation (applied in training loop after DataLoader)
+  cutmix_start_epoch: 8  # start CutMix after warmup + 3 main epochs
+  cutmix_prob: 0.3
+  cutmix_max_ratio: 0.2  # max 20% = 70/350 packets per cut
+
+  # H1a Subcarrier masking
+  subcarrier_mask_prob: 0.4
+  subcarrier_mask_min: 3
+  subcarrier_mask_max: 9
+
+  # H2 DFS masking
+  doppler_mask_prob: 0.3
+  time_mask_prob: 0.3
+
+evaluation:
+  protocol: LOSO           # Leave-One-Subject-Out
+  metric_primary: macro_f1
+  n_folds: 8
+  aggregate: recording     # 'window' or 'recording' for final metrics
+
+logging:
+  log_every_n_steps: 10
+  use_tensorboard: true
+
+seed: 42

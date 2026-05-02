@@ -1,0 +1,56 @@
+# configs/dataset_own.yaml
+# Own-collected data: ASUS RT-AC86U × 3 (BCM4366c0), Nexmon CSI
+# Override keys from base.yaml
+
+dataset:
+  name: own
+  raw_dir: data/raw/own
+  processed_dir: data/processed/own
+
+  # Collection parameters
+  n_subjects: 8
+  n_rooms: 2
+  n_setups_per_room: 2
+  n_trajectories: 8
+  n_reps: 10
+  duration_s: 5.0
+
+  # Hardware
+  hardware: BCM4366c0          # ASUS RT-AC86U chipset
+  csi_tool: nexmon             # Nexmon CSI extractor
+  freq_ghz: 5.0
+  bandwidth_mhz: 20
+  fs_nominal: 350.0            # nominal sampling rate (Hz)
+  n_fft_bins: 64               # raw FFT bins before A3 selection
+  n_subcarriers_raw: 52        # after A3: bins 1..26 (pos) + 38..63 (neg)
+  n_antennas_raw: 4            # BCM4366c0: 4 receive cores
+  n_receivers_raw: 3           # 3 × RT-AC86U
+
+  # Subcarrier selection (A3) — BCM4366c0 / 802.11n HT20
+  # Keeps ±1..±26 data subs; discards DC, guard (±29..±31), edge (±27..±28)
+  pos_bins_slice: [1, 27]      # bins 1..26 inclusive (26 bins)
+  neg_bins_slice: [38, 64]     # bins 38..63 inclusive (26 bins) = -26..-1
+
+  # AP MAC filter (optional — set to null to accept all MACs)
+  src_mac: null
+
+  # Class definitions
+  class_names:
+    - walk          # 0
+    - run           # 1
+    - stand_up      # 2
+    - sit_down      # 3
+    - bend          # 4  (cúi nhặt đồ)
+    - fall          # 5  (ngã)
+    - lying_still   # 6  (nằm yên)
+    - empty         # 7  (phòng trống)
+  class_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+
+  # Expected file naming convention:
+  # data/raw/own/person_P{n}/room_{r}/setup_{s}/trajectory_Tr{t}/
+  #     {activity}_rep{rep:02d}_rx{0,1,2}.pcap
+  # Example: person_P0/room_01/setup_01/trajectory_Tr0/walk_rep00_rx0.pcap
+
+# Override evaluation for 8-person LOSO
+evaluation:
+  n_folds: 8
