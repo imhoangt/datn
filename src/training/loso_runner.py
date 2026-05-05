@@ -238,7 +238,7 @@ def run_loso(
             train_ds.global_epoch = global_epoch
             train_m = train_one_epoch(model, train_loader, optimizer, scaler,
                                       ema, global_epoch, class_weights, cfg_tr,
-                                      device, aug_level='minimal')
+                                      device, aug_level='no_aug')
             val_f1, _, _ = evaluate_with_ema(model, ema, val_loader, device)
             log.log(global_epoch, 'train', {**train_m, 'lr': lr})
             log.log(global_epoch, 'val',   {'macro_f1': val_f1})
@@ -283,7 +283,7 @@ def run_loso(
             train_ds.global_epoch = global_epoch
             train_m = train_one_epoch(model, train_loader, optimizer, scaler,
                                       ema, global_epoch, class_weights, cfg_tr,
-                                      device, aug_level='light')
+                                      device, aug_level='no_aug')
             sched3.step()
             val_f1, _, _ = evaluate_with_ema(model, ema, val_loader, device)
             log.log(global_epoch, 'train', {**train_m, 'lr': optimizer.param_groups[0]['lr']})

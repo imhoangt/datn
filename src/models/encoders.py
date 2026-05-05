@@ -4,17 +4,34 @@ DilatedConvTransformerBlock (DCT-Block): Pre-LN, dilated depthwise conv + self-a
 AmpEncoder: 2× DCT-Block (k=7, d=[2,4]) with gradient checkpointing
 DfsEncoder: 2× DCT-Block (k=5, d=[1,2]) with gradient checkpointing
 
-Design notes (v6.6):
+Design notes (v7.0):
 - Pre-LN for training stability [Xiong et al., ICML 2020]
 - PE injected upstream (Stem); blocks add no internal PE
 - Gradient checkpointing on ALL blocks, only during training [v6.4]
 - Weight sharing: one encoder instance is called 3× (M=3 receivers)
+- DropPath (stochastic depth) added to all 3 residuals [FIX-T3]
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
+
+
+class DropPath(nn.Module):
+    """Stochastic depth — drops entire samples with probability p. No timm dependency."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)   # [B, 1, 1] broadcast
+        mask = torch.floor(torch.rand(shape, dtype=x.dtype, device=x.device) + keep_prob)
+        return x * mask / keep_prob
 
 
 class DilatedConvTransformerBlock(nn.Module):
@@ -25,12 +42,13 @@ class DilatedConvTransformerBlock(nn.Module):
         3. Feed-forward network
 
     Args:
-        D          : model dimension
-        kernel_size: depthwise conv kernel
-        dilation   : dilation factor for depthwise conv
-        n_heads    : MHA heads (D must be divisible by n_heads)
-        ffn_ratio  : FFN hidden dim = D × ffn_ratio
-        dropout    : dropout probability
+        D              : model dimension
+        kernel_size    : depthwise conv kernel
+        dilation       : dilation factor for depthwise conv
+        n_heads        : MHA heads (D must be divisible by n_heads)
+        ffn_ratio      : FFN hidden dim = D × ffn_ratio
+        dropout        : dropout probability
+        drop_path_rate : stochastic depth probability (FIX-T3)
     """
 
     def __init__(
@@ -41,6 +59,7 @@ class DilatedConvTransformerBlock(nn.Module):
         n_heads: int = 4,
         ffn_ratio: int = 2,
         dropout: float = 0.1,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         assert D % n_heads == 0, f"D={D} must be divisible by n_heads={n_heads}"
@@ -72,6 +91,11 @@ class DilatedConvTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
+        # DropPath for each residual branch (FIX-T3)
+        self.dp1 = DropPath(drop_path_rate)   # conv branch
+        self.dp2 = DropPath(drop_path_rate)   # attention branch
+        self.dp3 = DropPath(drop_path_rate)   # FFN branch
+
         self._init_weights()
 
     def _init_weights(self):
@@ -88,16 +112,16 @@ class DilatedConvTransformerBlock(nn.Module):
         """x: [B, T, D] → [B, T, D]"""
         # --- Branch 1: Dilated depthwise conv (local) ---
         h = self.norm1(x).transpose(1, 2)          # [B, D, T]
-        h = self.pw_conv(self.dw_conv(h)).transpose(1, 2)  # [B, T, D]
-        x = x + h
+        h_conv = self.pw_conv(self.dw_conv(h)).transpose(1, 2)  # [B, T, D]
+        x = x + self.dp1(h_conv)
 
         # --- Branch 2: Self-attention (global) ---
         h_n = self.norm2(x)                         # cache pre-norm [B, T, D]
-        h, _ = self.attn(h_n, h_n, h_n)
-        x = x + h
+        h_attn, _ = self.attn(h_n, h_n, h_n)
+        x = x + self.dp2(h_attn)
 
         # --- Branch 3: FFN ---
-        x = x + self.ffn(self.norm3(x))
+        x = x + self.dp3(self.ffn(self.norm3(x)))
 
         return x
 
@@ -112,12 +136,14 @@ class AmpEncoder(nn.Module):
     One instance is reused for M=3 receivers → weight sharing.
     """
 
-    def __init__(self, D: int = 80, use_checkpoint: bool = True):
+    def __init__(self, D: int = 80, use_checkpoint: bool = True, drop_path_rate: float = 0.0):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.blocks = nn.ModuleList([
-            DilatedConvTransformerBlock(D, kernel_size=7, dilation=2, n_heads=4),
-            DilatedConvTransformerBlock(D, kernel_size=7, dilation=4, n_heads=4),
+            DilatedConvTransformerBlock(D, kernel_size=7, dilation=2, n_heads=4,
+                                        drop_path_rate=drop_path_rate),
+            DilatedConvTransformerBlock(D, kernel_size=7, dilation=4, n_heads=4,
+                                        drop_path_rate=drop_path_rate),
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -140,12 +166,14 @@ class DfsEncoder(nn.Module):
     One instance is reused for M=3 receivers → weight sharing.
     """
 
-    def __init__(self, D: int = 80, use_checkpoint: bool = True):
+    def __init__(self, D: int = 80, use_checkpoint: bool = True, drop_path_rate: float = 0.0):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.blocks = nn.ModuleList([
-            DilatedConvTransformerBlock(D, kernel_size=5, dilation=1, n_heads=4),
-            DilatedConvTransformerBlock(D, kernel_size=5, dilation=2, n_heads=4),
+            DilatedConvTransformerBlock(D, kernel_size=5, dilation=1, n_heads=4,
+                                        drop_path_rate=drop_path_rate),
+            DilatedConvTransformerBlock(D, kernel_size=5, dilation=2, n_heads=4,
+                                        drop_path_rate=drop_path_rate),
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

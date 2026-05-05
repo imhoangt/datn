@@ -2,7 +2,7 @@
 src/models/readout.py
 DualScaleReadout: combines fast (v_mean, v_energy) and slow (BlurPool) temporal features.
 
-Design notes (v6.6):
+Design notes (v7.1):
 - BlurPool: Binomial[1,4,6,4,1]/16 anti-aliasing filter, stride=4, padding=0
   → output length = (350-5)//4+1 = 87 frames ✓
 - groups=D for depthwise slow conv (separable)

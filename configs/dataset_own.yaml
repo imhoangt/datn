@@ -40,10 +40,10 @@ dataset:
     - run           # 1
     - stand_up      # 2
     - sit_down      # 3
-    - bend          # 4  (cúi nhặt đồ)
+    - bend_to_pick  # 4  (cúi nhặt đồ)
     - fall          # 5  (ngã)
-    - lying_still   # 6  (nằm yên)
-    - empty         # 7  (phòng trống)
+    - lay_still     # 6  (nằm yên)
+    - empty_room    # 7  (phòng trống)
   class_ids: [0, 1, 2, 3, 4, 5, 6, 7]
 
   # Expected file naming convention:

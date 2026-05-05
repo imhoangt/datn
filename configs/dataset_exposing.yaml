@@ -1,14 +1,14 @@
 # configs/dataset_exposing.yaml
 # "Exposing the CSI: A Systematic Investigation of CSI-based WiFi Sensing Datasets"
 # Cominelli et al., PerCom 2023
-# Hardware: Broadcom 43684 (AX-CSI), 802.11ax / Wi-Fi 6
+# Hardware: Broadcom 43684 (AX-CSI), 802.11ax / Wi-Fi 6, 1 volunteer
 # GitHub: https://github.com/ansresearch/exposing-the-csi
 # Override keys from base.yaml
 
 dataset:
   name: exposing
-  raw_dir: data/raw/exposing
-  processed_dir: data/processed/exposing
+  raw_dir: data/raw/expose_csi
+  processed_dir: data/processed/expose_csi
 
   # Hardware
   hardware: Broadcom43684      # AX-CSI, 802.11ax (Wi-Fi 6)
@@ -16,65 +16,53 @@ dataset:
   freq_ghz: 5.0
   bandwidth_mhz: 160           # 160MHz channel → 2048 subcarriers
   fs_nominal: 150.0            # 150 frames/sec injection rate
-  n_subcarriers_raw: 2048      # 802.11ax / 160MHz
+  n_subcarriers_raw: 2048      # 802.11ax / 160MHz → select 52 uniformly
   n_antennas_raw: 4
-  n_receivers_raw: 3           # 3 collector devices
-  n_subjects: 3                # 3 subjects in original dataset
+  n_receivers_raw: 3           # 3 collector devices (rx_01/rx_02/rx_03)
+  n_subjects: 1                # 1 volunteer → no LOSO; use blocked 5-fold
   duration_s: 80.0             # ~80s sessions
 
-  # Subcarrier normalization: 2048 → 52 (uniform selection)
+  # Subcarrier normalization: 2048 → 52 (uniform selection, preserves coverage)
   sub_strategy: uniform_select
-  # Uniform selection preserves full spectral coverage:
-  # indices = round(linspace(0, 2047, 52)) → evenly spaced across 160MHz band
 
   # Antenna normalization: 4 → 4 (no change needed)
   ant_strategy: none
 
-  # Class mapping: 12 Exposing activities → our 8 target classes
-  class_mapping:
-    "walking"       : 0    # walk
-    "walk"          : 0
-    "running"       : 1    # run
-    "run"           : 1
-    "standing"      : 2    # stand_up (standing still → map to stand_up context)
-    "standing up"   : 2
-    "stand up"      : 2
-    "sitting"       : 3    # sit_down (sitting still → map to sit_down context)
-    "sitting down"  : 3
-    "sit down"      : 3
-    "bending"       : 4    # bend
-    "bend"          : 4
-    "picking"       : 4
-    "falling"       : 5    # fall
-    "fall"          : 5
-    "lying"         : 6    # lying_still
-    "lying down"    : 6
-    "lying still"   : 6
-    "empty"         : 7    # empty
-    "no one"        : 7
-    "background"    : 7
-    "no person"     : 7
-    # Activities in dataset that don't map cleanly — assign to nearest:
-    "gesturing"     : 4    # closest to bend/motion
-    "other"         : 7    # treat as background
+  # Directory structure:
+  # data/raw/expose_csi/rx_01/S7a_{X}.mat   X = activity code letter
+  # data/raw/expose_csi/rx_02/S7b_{X}.mat
+  # data/raw/expose_csi/rx_03/S7c_{X}.mat
+  # File shape: [12000, 2048, 4] complex
+
+  # Activity code letter → our 8-class label
+  class_code_map:
+    A: 0    # walk
+    B: 1    # run
+    C: 2    # jump
+    D: 3    # sit_still
+    K: 4    # squat
+    I: 5    # lay_down
+    H: 6    # clap
+    E: 7    # empty
 
   class_names:
     - walk          # 0
     - run           # 1
-    - stand_up      # 2
-    - sit_down      # 3
-    - bend          # 4
-    - fall          # 5
-    - lying_still   # 6
+    - jump          # 2
+    - sit_still     # 3
+    - squat         # 4
+    - lay_down      # 5
+    - clap          # 6
     - empty         # 7
+  class_ids: [0, 1, 2, 3, 4, 5, 6, 7]
 
-  # Expected file structure (3 receivers = 3 separate files per session):
-  # data/raw/exposing/{activity}/{session_id}_rx0.npy
-  # data/raw/exposing/{activity}/{session_id}_rx1.npy
-  # data/raw/exposing/{activity}/{session_id}_rx2.npy
-  # Array shape: [T, 2048] or [T, 2048, streams] complex64
+# Class weights: empty=3.0 (imbalanced), others uniform
+training:
+  class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0]
 
-# LOSO over 3 subjects
+# Blocked chronological 5-fold (single volunteer, no LOSO possible)
+# Each activity's ~66 windows split into 5 contiguous time blocks.
+# fold_id = test block; remaining 4 = train.
 evaluation:
-  n_folds: 3
-  protocol: LOSO
+  n_folds: 5
+  protocol: blocked_5fold

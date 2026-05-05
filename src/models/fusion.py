@@ -2,15 +2,18 @@
 src/models/fusion.py
 CrossModalFusion: gated cross-attention (Q=Z_amp, K/V=Z_dfs)
 ReceiverFusion:   learnable weighted sum of M receiver representations
+ReceiverContextFusion: lightweight cross-receiver context sharing
 
-Design notes (v6.6):
+Design notes (v7.0):
 - CrossModalFusion: self.norm_out is named module (FIX v6.0); gate init=-2.0
-- ReceiverFusion:   z_per_recv stacked [B,3,D] for L_cons (FIX v6.0)
+- ReceiverFusion: weight_proj uses concat(mean,var) → Linear(D*M*2, M) (FIX-M2)
+  Variance term makes alpha sensitive to locally noisy receivers
+- ReceiverContextFusion: FiLM-style residual cross-RX context; gate init=0 (FIX-M4)
+  Safe warm-start: tanh(0)=0 → no effect at epoch 0, learns to activate gradually
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CrossModalFusion(nn.Module):
@@ -59,9 +62,9 @@ class ReceiverFusion(nn.Module):
     """
     Combines M=3 per-receiver encoded representations into one global representation.
 
-    For each receiver m, we pool Z_fused_m over time to get a [B, D] descriptor.
-    A linear layer maps the concatenated descriptors [B, D*M] to M attention weights α.
-    The output is a weighted temporal sum across receivers.
+    For each receiver m, we pool Z_fused_m over time to get mean [B,D] and variance [B,D].
+    A linear layer maps the concatenated mean+var descriptors [B, D*M*2] to M weights α.
+    Variance term detects locally noisy receivers (FIX-M2).
 
     Also returns z_per_recv [B, M, D] for L_cons (receiver consistency loss).
     """
@@ -69,8 +72,8 @@ class ReceiverFusion(nn.Module):
     def __init__(self, D: int = 80, M: int = 3):
         super().__init__()
         self.M = M
-        # 240 → 3 = 723 params
-        self.weight_proj = nn.Linear(D * M, M)
+        # D*M*2 → M: mean+var concat (FIX-M2); was D*M → M
+        self.weight_proj = nn.Linear(D * M * 2, M)
 
     def forward(
         self, Z_fused_list: list
@@ -81,16 +84,17 @@ class ReceiverFusion(nn.Module):
             Z_global   [B, T=350, D]   — weighted global representation
             z_per_recv [B, M, D]       — per-receiver global descriptors
         """
-        # Time-pool each receiver: [B, D]
-        z_means = [Z.mean(dim=1) for Z in Z_fused_list]       # list of [B, D]
+        # Time-pool each receiver: mean [B, D] and variance [B, D]
+        z_means = [Z.mean(dim=1) for Z in Z_fused_list]                       # M × [B, D]
+        z_vars  = [Z.var(dim=1, unbiased=False) for Z in Z_fused_list]        # M × [B, D]
 
         # Stack for L_cons: [B, M, D]
         z_per_recv = torch.stack(z_means, dim=1)
 
-        # Compute attention weights: [B, M]
-        alpha = torch.softmax(
-            self.weight_proj(torch.cat(z_means, dim=-1)), dim=-1
-        )
+        # Compute attention weights using mean+var concat (FIX-M2)
+        # Python list concat (not tensor addition): 2*M items → [B, D*M*2]
+        feat  = torch.cat(z_means + z_vars, dim=-1)
+        alpha = torch.softmax(self.weight_proj(feat), dim=-1)   # [B, M]
 
         # Weighted temporal sum: [B, T, D]
         Z_global = sum(
@@ -99,3 +103,40 @@ class ReceiverFusion(nn.Module):
         )
 
         return Z_global, z_per_recv
+
+
+class ReceiverContextFusion(nn.Module):
+    """
+    Lightweight cross-receiver context sharing (FIX-M4).
+
+    Each receiver receives a residual update from the mean of the other receivers'
+    temporal representations. Gate initialized to 0 → tanh(0)=0 → safe warm-start
+    (no effect at epoch 0, learns to activate gradually).
+
+    Params: D×D + D + 1 = 6481 for D=80.
+    """
+
+    def __init__(self, D: int = 80):
+        super().__init__()
+        self.context_proj = nn.Linear(D, D)
+        self.gate = nn.Parameter(torch.zeros(1))
+        nn.init.xavier_uniform_(self.context_proj.weight)
+        nn.init.zeros_(self.context_proj.bias)
+
+    def forward(self, Z_list: list) -> list:
+        """
+        Z_list: M × [B, T, D]
+        returns: M × [B, T, D] with cross-receiver residual context added
+        """
+        M = len(Z_list)
+        if M <= 1:
+            return Z_list
+        z_means = [Z.mean(dim=1) for Z in Z_list]      # M × [B, D]
+        Z_out = []
+        for m in range(M):
+            # Context = mean of all other receivers' temporal representations
+            others = [z_means[k] for k in range(M) if k != m]
+            ctx = torch.stack(others, dim=0).mean(dim=0)    # [B, D]
+            ctx = self.context_proj(ctx).unsqueeze(1)        # [B, 1, D]
+            Z_out.append(Z_list[m] + torch.tanh(self.gate) * ctx)
+        return Z_out

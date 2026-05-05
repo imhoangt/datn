@@ -797,7 +797,8 @@ def augment_amp(
 
 def augment_dfs(X_dfs: np.ndarray, cfg: dict) -> np.ndarray:
     """
-    Branch β augmentation (H2a Doppler masking, H2b time masking).
+    Branch β on-the-fly augmentation (H2a Doppler masking, H2b time masking).
+    Kept for backwards-compat; offline equivalent is augment_features_offline.
     fill=0.0 = background level after G7 median-centering.
     """
     # H2a: Doppler-bin masking
@@ -815,3 +816,153 @@ def augment_dfs(X_dfs: np.ndarray, cfg: dict) -> np.ndarray:
         X_dfs[t_s:t_s + t_m, :, :] = 0.0
 
     return X_dfs
+
+
+# ---------------------------------------------------------------------------
+# Offline augmentation — deterministic, reproducible, stored in HDF5
+#
+# Design (verified against literature):
+#   • Seeded np.random.RandomState → reproducible across runs / machines
+#   • Physics-motivated E-stage ordering:
+#       E1 temporal shift → E6 phase jitter → E2 amplitude scale
+#       → E3 antenna dropout → E4 receiver dropout → E5 additive noise
+#   • SpecAugment-motivated H-stage ordering:
+#       H1a subcarrier (freq) mask → H2a Doppler (freq) mask → H2b time mask
+#   • Probabilities raised vs. on-the-fly; diversity via parameter sampling
+#   • E-stage and H-stage use different prime multipliers → independent RNG draws
+# ---------------------------------------------------------------------------
+
+def _window_seed(recording_id: str, window_idx: int) -> int:
+    """
+    Deterministic 31-bit seed for one (recording, window) pair.
+    SHA-256 avoids collisions across large datasets.
+    """
+    import hashlib
+    key = f"{recording_id}_{window_idx}".encode('utf-8')
+    return int(hashlib.sha256(key).hexdigest()[:8], 16) % (2 ** 31 - 1)
+
+
+def augment_joint_offline(
+    H_window       : np.ndarray,
+    ref_antenna_idx: int,
+    copy_id        : int,
+    base_seed      : int,
+) -> np.ndarray:
+    """
+    E-stage offline augmentation on raw complex CSI window.
+
+    Ordering (physics-motivated):
+      E1  Temporal shift   — geometry first; edge-pad preserves shape [T,F,M,A]
+      E6  Phase jitter     — per-antenna oscillator offset (spectrally flat)
+      E2  Amplitude scale  — amplifier gain fluctuation (after phase)
+      E3  Antenna dropout  — hardware failure (never drops ref antenna)
+      E4  Receiver dropout — receiver failure
+      E5  Gaussian noise   — additive measurement noise last
+
+    H_window : [T=350, F, M=3, A=4] complex64
+    copy_id  : 1-based (1..N_aug)
+    base_seed: from _window_seed(recording_id, window_idx)
+    Returns  : same shape, complex64
+    """
+    rng = np.random.RandomState((base_seed * 7 + copy_id * 1009) % (2 ** 31 - 1))
+    H   = H_window.copy()
+    T, F, M, A = H.shape
+
+    # E1: Temporal shift ±30 packets (p=0.90) — first, preserves temporal structure
+    if rng.rand() < 0.90:
+        sh = int(rng.randint(-30, 31))
+        if sh > 0:
+            H = np.concatenate([H[:1].repeat(sh, axis=0), H[:-sh]], axis=0)
+        elif sh < 0:
+            H = np.concatenate([H[-sh:], H[-1:].repeat(-sh, axis=0)], axis=0)
+
+    # E6 (NEW): Per-antenna phase jitter (p=0.70)
+    # Physical basis: oscillator drift is spectrally flat → same θ for all F subs,
+    # independent across antennas. Range ±π/4 keeps conjugate-mult coherent.
+    if rng.rand() < 0.70:
+        for a in range(A):
+            theta = rng.uniform(-np.pi / 4.0, np.pi / 4.0)
+            H[:, :, :, a] = (H[:, :, :, a] * np.exp(1j * theta)).astype(np.complex64)
+
+    # E2: Amplitude scale (p=0.90) — conservative [0.75,1.25] for transformer
+    if rng.rand() < 0.90:
+        H = H * np.float32(rng.uniform(0.75, 1.25))
+
+    # E3: Antenna dropout (p=0.40) — never drop reference antenna
+    if rng.rand() < 0.40:
+        non_ref  = [a for a in range(A) if a != ref_antenna_idx]
+        drop_ant = int(rng.choice(non_ref))
+        noise    = (rng.randn(T, F, M) + 1j * rng.randn(T, F, M))
+        H[:, :, :, drop_ant] = (noise * 0.01).astype(np.complex64)
+
+    # E4: Receiver dropout (p=0.15)
+    if rng.rand() < 0.15:
+        drop_rx = int(rng.randint(0, M))
+        noise   = (rng.randn(T, F, A) + 1j * rng.randn(T, F, A))
+        H[:, :, drop_rx, :] = (noise * 0.01).astype(np.complex64)
+
+    # E5: Complex Gaussian noise (p=0.70) — additive, applied last
+    # Adaptive sigma [0.005, 0.02] for richer diversity across copies.
+    if rng.rand() < 0.70:
+        sigma = rng.uniform(0.005, 0.02)
+        H = H + (sigma * (rng.randn(T, F, M, A) +
+                          1j * rng.randn(T, F, M, A))).astype(np.complex64)
+
+    return H.astype(np.complex64)
+
+
+def augment_features_offline(
+    X_amp    : np.ndarray,
+    X_dfs    : np.ndarray,
+    copy_id  : int,
+    base_seed: int,
+    cfg      : dict,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    H-stage offline augmentation on extracted features.
+
+    Ordering (SpecAugment-motivated: frequency masking > time masking):
+      H1a  Subcarrier masking  — freq mask on amplitude branch
+      H2a  Doppler masking     — freq mask on DFS branch (freq before time)
+      H2b  Time-frame masking  — time mask on DFS branch
+
+    fill=0.0 is correct: G7 median-centers → 0 ≈ background.
+
+    X_amp : [T=350, F, M=3, A=4] float32
+    X_dfs : [T_dfs=28, V=128, M=3] float32
+    cfg   : training section of base.yaml
+    Returns: (X_amp_aug, X_dfs_aug), same shapes, float32
+    """
+    # Different prime multipliers from E-stage → statistically independent draws
+    rng = np.random.RandomState(
+        (base_seed * 13 + copy_id * 997 + 31337) % (2 ** 31 - 1)
+    )
+    F    = X_amp.shape[1]
+    V    = X_dfs.shape[1]
+    Tdfs = X_dfs.shape[0]
+
+    # H1a: Subcarrier masking — frequency masking first (SpecAugment ordering)
+    if rng.rand() < cfg.get('subcarrier_mask_prob_offline', 0.80):
+        mask_min = cfg.get('subcarrier_mask_min', 3)
+        mask_max = cfg.get('subcarrier_mask_max', 9)
+        n_mask   = int(rng.randint(mask_min, mask_max + 1))
+        f_start  = int(rng.randint(0, max(1, F - n_mask)))
+        X_amp    = X_amp.copy()
+        X_amp[:, f_start:f_start + n_mask, :, :] = 0.0
+
+    # H2a: Doppler-bin masking — frequency masking before time masking
+    if rng.rand() < cfg.get('doppler_mask_prob_offline', 0.60):
+        n_m = int(rng.randint(2, min(8, V)))
+        v_s = int(rng.randint(0, max(1, V - n_m)))
+        X_dfs = X_dfs.copy()
+        X_dfs[:, v_s:v_s + n_m, :] = 0.0
+
+    # H2b: Time-frame masking — time masking second
+    if rng.rand() < cfg.get('time_mask_prob_offline', 0.60):
+        t_m = int(rng.randint(1, min(5, Tdfs)))
+        t_s = int(rng.randint(0, max(1, Tdfs - t_m)))
+        if not X_dfs.flags['OWNDATA']:
+            X_dfs = X_dfs.copy()
+        X_dfs[t_s:t_s + t_m, :, :] = 0.0
+
+    return X_amp, X_dfs

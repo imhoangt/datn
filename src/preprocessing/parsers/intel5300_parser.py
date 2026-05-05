@@ -1,142 +1,143 @@
 """
 src/preprocessing/parsers/intel5300_parser.py
-Parse Intel 5300 NIC CSI data for XRF55 dataset.
+Parse Intel 5300 CSI Tool binary .dat files (XRF55 dataset).
 
-Intel 5300 / linux-80211n-csitool format:
-  - 30 subcarrier groups (each group = 2 adjacent subs at 20MHz)
-  - Complex int8 (signed 8-bit real + 8-bit imag)
-  - 3 antennas per device
-  - Sampling rate: ~200 Hz (varies, typically stored in .dat or .mat files)
-  - Data shape from XRF55: (200*t) × 1 × 3 × 3 × 30 where t = duration in seconds
-    → for our pipeline: T × M × A × F = T × 3 × 3 × 30
+Binary record format (linux-80211n-csitool):
+    [2B field_len big-endian] [1B code=0xBB] [20B header] [len_csi bytes CSI]
 
-XRF55 stores WiFi CSI as numpy .npy or .mat files.
-We normalize: [T, 30, 3] complex64 (single RX, 3 antennas, 30 subcarriers)
-Then pad subcarriers 30→52 (zero-pad) and antennas 3→4 (zero-pad) for uniform model input.
+Header layout (20 bytes):
+    timestamp(4) + bfee_count(2) + reserved(2) + Nrx(1) + Ntx(1) +
+    rssi_a(1) + rssi_b(1) + rssi_c(1) + noise(1) + agc(1) +
+    antenna_sel(1) + len_csi(2 LE) + flags(2) = 20 bytes
+
+CSI data: 10-bit packed signed integers, order [sub][Tx][Rx] × (imag, real).
+Signed: val >= 512 → val - 1024.
+
+Output per file: [T, n_sub=30, Nrx] complex64
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# XRF55 nominal sampling rate (packets/sec)
-XRF55_FS_NOMINAL = 200.0
-# Intel 5300 subcarrier count at 20MHz
-INTEL5300_N_SUBS = 30
+XRF55_FS_NOMINAL = 200.0   # nominal sampling rate (packets/sec)
+INTEL5300_N_SUBS = 30       # Intel 5300: 30 subcarrier groups at 20MHz
 
 
-def parse_xrf55_csi(
-    file_path: str | Path,
-    file_format: str = 'auto',
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def parse_intel5300_dat(
+    filepath: str | Path,
+    n_sub: int = 30,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Load XRF55 WiFi CSI from numpy/mat file.
+    Parse Intel 5300 CSI Tool binary .dat file.
 
-    XRF55 WiFi CSI shape from paper: (200t × 1 × 3 × 3 × 30)
-        dim0: T samples (200 Hz × t seconds)
-        dim1: 1 (TX antennas, single TX)
-        dim2: 3 (receivers / RX devices)
-        dim3: 3 (RX antennas per device)
-        dim4: 30 subcarriers
-
-    We reshape to: [T, 30, M=3, A=3] complex64 per receiver grouping.
+    Args:
+        filepath: path to .dat file
+        n_sub:    number of subcarriers (default 30 for Intel 5300 20MHz)
 
     Returns:
-        H_raw      [T, 30, M=3, A=3] complex64 (None if error)
-        timestamps [T] float64 (synthesized at 200Hz if not available)
+        H         [T, n_sub, Nrx] complex64
+        timestamps [T] float64 (synthesized at XRF55_FS_NOMINAL if not extracted)
+
+    Raises:
+        FileNotFoundError: if file does not exist (raised by open())
+        ValueError: if file contains 0 valid CSI records
     """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        logger.error(f"File not found: {file_path}")
-        return None, None
+    records = []
 
-    # Determine format
-    suffix = file_path.suffix.lower()
-    if file_format == 'auto':
-        file_format = suffix.lstrip('.')
+    with open(filepath, 'rb') as f:
+        while True:
+            # Each record begins with 2-byte big-endian field_len + 1-byte code
+            header_bytes = f.read(3)
+            if len(header_bytes) < 3:
+                break   # EOF
 
-    try:
-        if file_format in ('npy', 'npz'):
-            data = np.load(file_path, allow_pickle=True)
-            if isinstance(data, np.ndarray):
-                csi_raw = data
-            else:
-                # .npz: try 'csi' or first key
-                key = 'csi' if 'csi' in data else list(data.keys())[0]
-                csi_raw = data[key]
+            field_len = int.from_bytes(header_bytes[:2], 'big')
+            code      = header_bytes[2]
 
-        elif file_format == 'mat':
-            try:
-                import scipy.io as sio
-                mat = sio.loadmat(str(file_path))
-                # Try common keys in XRF55 mat files
-                for key in ('csi_trace', 'csi', 'data', 'WiFiCSI'):
-                    if key in mat:
-                        csi_raw = mat[key]
-                        break
-                else:
-                    # Use first non-metadata key
-                    keys = [k for k in mat.keys() if not k.startswith('_')]
-                    csi_raw = mat[keys[0]]
-            except ImportError:
-                logger.error("scipy.io not available for .mat parsing")
-                return None, None
+            if code != 0xBB:
+                # Not a CSI record — skip
+                remaining = field_len - 1   # already consumed 1 byte (code)
+                if remaining > 0:
+                    f.seek(remaining, 1)
+                continue
 
-        else:
-            logger.error(f"Unsupported format: {file_format}")
-            return None, None
+            # Read 20-byte header
+            hdr = f.read(20)
+            if len(hdr) < 20:
+                break
 
-    except Exception as e:
-        logger.error(f"Failed to load {file_path}: {e}")
-        return None, None
+            Nrx     = hdr[8]
+            Ntx     = hdr[9]
+            len_csi = int.from_bytes(hdr[14:16], 'little')
 
-    # Parse shape
-    csi_raw = np.array(csi_raw)
-    if csi_raw.ndim == 5:
-        # (T, 1, M=3, A=3, F=30) → rearrange to (T, F=30, M=3, A=3)
-        T, _, M, A, F = csi_raw.shape
-        H_raw = csi_raw[:, 0, :, :, :]          # [T, M, A, F]
-        H_raw = H_raw.transpose(0, 3, 1, 2)     # [T, F, M, A]
-    elif csi_raw.ndim == 4:
-        # Assume [T, F, M, A] or [T, M, A, F]
-        if csi_raw.shape[-1] == 30:
-            # [T, M, A, F=30] → [T, F, M, A]
-            H_raw = csi_raw.transpose(0, 3, 1, 2)
-        elif csi_raw.shape[1] == 30:
-            # [T, F=30, M, A]
-            H_raw = csi_raw
-        else:
-            logger.error(f"Unexpected shape {csi_raw.shape}")
-            return None, None
-    elif csi_raw.ndim == 2:
-        # Flat [T, F*M*A] - rare
-        T = csi_raw.shape[0]
-        H_raw = csi_raw.reshape(T, 30, 3, 3)
-    else:
-        logger.error(f"Cannot parse shape {csi_raw.shape}")
-        return None, None
+            if Nrx < 1 or Ntx < 1:
+                f.seek(len_csi, 1)
+                continue
 
-    # Convert to complex64
-    if not np.iscomplexobj(H_raw):
-        # Some datasets store amplitude only → treat as real with zero imag
-        H_raw = H_raw.astype(np.float32).view(np.float32) + 0j
-        H_raw = H_raw.astype(np.complex64)
-    else:
-        H_raw = H_raw.astype(np.complex64)
+            csi_bytes = f.read(len_csi)
+            if len(csi_bytes) < len_csi:
+                break
 
-    T_raw = H_raw.shape[0]
+            H = _extract_csi(csi_bytes, Nrx, Ntx, n_sub)   # [n_sub, Ntx, Nrx]
+            records.append(H[:, 0, :])                        # Ntx=1 → [n_sub, Nrx]
 
-    # Synthesize timestamps at nominal fs (XRF55 doesn't always store timestamps)
-    timestamps = np.arange(T_raw, dtype=np.float64) / XRF55_FS_NOMINAL
+    if not records:
+        raise ValueError(f"No valid CSI records found in {filepath}")
 
-    logger.info(f"XRF55 loaded: {file_path.name} → shape {H_raw.shape}")
-    return H_raw, timestamps
+    H_all     = np.stack(records, axis=0).astype(np.complex64)   # [T, n_sub, Nrx]
+    T         = H_all.shape[0]
+    timestamps = np.arange(T, dtype=np.float64) / XRF55_FS_NOMINAL
+
+    return H_all, timestamps
+
+
+def _extract_csi(
+    csi_bytes: bytes,
+    Nrx: int,
+    Ntx: int,
+    n_sub: int,
+) -> np.ndarray:
+    """
+    Unpack 10-bit packed signed CSI integers from raw bytes.
+
+    Intel 5300 CSI order: for each sub → for each Tx → for each Rx → (imag, real).
+    Signed 10-bit: values >= 512 are negative (val - 1024).
+
+    Returns: [n_sub, Ntx, Nrx] complex64
+    """
+    H = np.zeros((n_sub, Ntx, Nrx), dtype=np.complex64)
+    data = np.frombuffer(csi_bytes, dtype=np.uint8).astype(np.int32)
+
+    bits_left = 0
+    buf       = 0
+    byte_idx  = 0
+
+    def read10() -> int:
+        nonlocal bits_left, buf, byte_idx
+        while bits_left < 10:
+            buf       |= int(data[byte_idx]) << bits_left
+            byte_idx  += 1
+            bits_left += 8
+        val       = buf & 0x3FF
+        buf      >>= 10
+        bits_left -= 10
+        return val - 1024 if val >= 512 else val
+
+    for k in range(n_sub):
+        for j in range(Ntx):
+            for i in range(Nrx):
+                imag = read10()
+                real = read10()
+                H[k, j, i] = complex(real, imag)
+
+    return H
 
 
 def normalize_intel5300_to_uniform(
@@ -145,41 +146,35 @@ def normalize_intel5300_to_uniform(
     target_A: int = 4,
 ) -> np.ndarray:
     """
-    Normalize Intel 5300 CSI [T, F_in, M, A_in] for pipeline consumption.
+    Pad/trim Intel 5300 CSI [T, F_in, A_in] to uniform shape for pipeline.
 
     Args:
-        target_F: if given, zero-pad (or trim) subcarriers to target_F.
-                  If None (default), keep original F_in subcarriers unchanged.
-        target_A: zero-pad (or trim) antenna dim to this count.
+        H_raw:    [T, F_in, A_in] complex64  (single receiver site)
+        target_F: if given, zero-pad (or trim) subcarriers; None = keep F_in
+        target_A: zero-pad (or trim) antenna dim
 
-    H_raw: [T, F_in, M, A_in] complex64
-    Returns: [T, F_out, M, target_A] complex64
-             where F_out = target_F if target_F is not None, else F_in
+    Returns: [T, F_out, target_A] complex64
     """
-    T, F_in, M, A_in = H_raw.shape
+    T, F_in, A_in = H_raw.shape
 
     # Subcarrier dimension
-    if target_F is None:
+    if target_F is None or target_F == F_in:
         H_padF = H_raw
     elif F_in < target_F:
-        pad_F  = target_F - F_in
-        H_padF = np.concatenate(
-            [H_raw, np.zeros((T, pad_F, M, A_in), dtype=np.complex64)],
-            axis=1,
-        )
+        pad = np.zeros((T, target_F - F_in, A_in), dtype=np.complex64)
+        H_padF = np.concatenate([H_raw, pad], axis=1)
     else:
-        H_padF = H_raw[:, :target_F]
+        H_padF = H_raw[:, :target_F, :]
 
     F_out = H_padF.shape[1]
 
     # Antenna dimension
     if A_in < target_A:
-        pad_A  = target_A - A_in
-        H_padA = np.concatenate(
-            [H_padF, np.zeros((T, F_out, M, pad_A), dtype=np.complex64)],
-            axis=3,
-        )
+        pad = np.zeros((T, F_out, target_A - A_in), dtype=np.complex64)
+        H_padA = np.concatenate([H_padF, pad], axis=2)
+    elif A_in > target_A:
+        H_padA = H_padF[:, :, :target_A]
     else:
-        H_padA = H_padF[:, :, :, :target_A]
+        H_padA = H_padF
 
     return H_padA

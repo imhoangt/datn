@@ -1,13 +1,16 @@
 """
 src/models/stems.py
-AmpStem: fuse antenna dim → project to D → inject TemporalPE + RecvEmbed
-DfsStem: 2D conv on spectrogram → project to D → inject TemporalPE + RecvEmbed
+AmpStem: joint F×A projection → D → inject TemporalPE + FiLM receiver conditioning
+DfsStem: 2D conv on spectrogram → project to D → inject TemporalPE + FiLM receiver conditioning
 
-Design notes (v6.6):
-- AmpStem: A and F_sub are constructor args → supports different hardware configs
+Design notes (v7.1):
+- AmpStem: joint_proj Linear(F*A→D) replaces sequential ant_mlp+freq_proj (FIX-M1)
+  Enables model to learn cross-(subcarrier, antenna) interactions
 - DfsStem: T_dfs=28, V_dfs=128 fixed by STFT params
 - Learnable Temporal PE (fixed-length T) [ref: PE survey arXiv:2502]
-- recv_embed.weight[rx_id] direct indexing [FIX v6.2]
+- FiLM receiver conditioning: scale×h + shift instead of additive h+embed (Perez 2018)
+  scale init=1 (identity), shift init=0 (no shift) → safe warm-start
+  Additive-only embed cannot modulate amplitude differences across hardware
 """
 
 import torch
@@ -21,10 +24,9 @@ class AmpStem(nn.Module):
     Output: z [B, T, D]
 
     Steps:
-        1. ant_mlp: [B,T,F,A] → [B,T,F,1] → [B,T,F]   fuse A antennas
-        2. freq_proj + LayerNorm: [B,T,F] → [B,T,D]    project subcarriers
-        3. + TemporalPE [T,D]                            inject temporal order
-        4. + RecvEmbed [D]                               inject receiver identity
+        1. joint_proj + LayerNorm: [B,T,F*A=208] → [B,T,D]   joint F×A projection
+        2. + TemporalPE [T,D]                                  inject temporal order
+        3. FiLM: scale[rx_id] × h + shift[rx_id]              modulate by receiver identity
     """
 
     def __init__(self, D: int = 80, A: int = 4, F_sub: int = 52, T: int = 350):
@@ -34,27 +36,24 @@ class AmpStem(nn.Module):
         self.F_sub = F_sub
         self.A     = A
 
-        # Antenna fusion: A → A → 1 (shared across T, F positions via nn.Linear on last dim)
-        self.ant_mlp = nn.Sequential(
-            nn.Linear(A, A),
-            nn.GELU(),
-            nn.Linear(A, 1),
-        )
-        # Subcarrier projection
-        self.freq_proj   = nn.Linear(F_sub, D)
+        # Joint F×A projection: flatten F and A then project (FIX-M1)
+        self.joint_proj  = nn.Linear(F_sub * A, D)
         self.norm        = nn.LayerNorm(D)
         # Positional encoding (learnable, T tokens)
         self.temporal_pe = nn.Embedding(T, D)
-        # Receiver identity embedding (M=3 receivers)
-        self.recv_embed  = nn.Embedding(3, D)
+        # FiLM receiver conditioning (Perez et al. 2018): scale×h + shift
+        # scale init=1 → identity; shift init=0 → no offset (safe warm-start)
+        self.recv_scale  = nn.Embedding(3, D)
+        self.recv_shift  = nn.Embedding(3, D)
 
         self._init_weights()
 
     def _init_weights(self):
         nn.init.trunc_normal_(self.temporal_pe.weight, std=0.02)
-        nn.init.trunc_normal_(self.recv_embed.weight,  std=0.02)
-        nn.init.xavier_uniform_(self.freq_proj.weight)
-        nn.init.zeros_(self.freq_proj.bias)
+        nn.init.ones_(self.recv_scale.weight)    # identity scale at init
+        nn.init.zeros_(self.recv_shift.weight)   # zero shift at init
+        nn.init.xavier_uniform_(self.joint_proj.weight)
+        nn.init.zeros_(self.joint_proj.bias)
 
     def forward(self, x: torch.Tensor, rx_id: int) -> torch.Tensor:
         """
@@ -62,18 +61,19 @@ class AmpStem(nn.Module):
         rx_id: int in {0,1,2}
         return [B, T, D]
         """
-        # 1. Antenna fusion: [B,T,F,A] → [B,T,F,1] → [B,T,F]
-        h = self.ant_mlp(x).squeeze(-1)                              # [B, T, F]
+        # 1. Joint F×A projection: flatten last two dims, then project + LN
+        B, T, F, A = x.shape
+        h = x.reshape(B, T, F * A)               # [B, T, F*A=208] — reshape (not view) for non-contiguous slices
+        h = self.norm(self.joint_proj(h))         # [B, T, D]
 
-        # 2. Frequency projection + LN: [B,T,F] → [B,T,D]
-        h = self.norm(self.freq_proj(h))                              # [B, T, D]
-
-        # 3. Temporal positional encoding
+        # 2. Temporal positional encoding
         positions = torch.arange(h.size(1), device=h.device)         # [T]
         h = h + self.temporal_pe(positions)                           # broadcast [T,D]
 
-        # 4. Receiver identity embedding (direct weight indexing)
-        h = h + self.recv_embed.weight[rx_id]                         # broadcast [D]
+        # 3. FiLM receiver modulation: scale × h + shift (direct weight indexing)
+        scale = self.recv_scale.weight[rx_id]     # [D]
+        shift = self.recv_shift.weight[rx_id]     # [D]
+        h = h * scale + shift                     # [B, T, D] broadcasts with [D]
 
         return h   # [B, T, D]
 
@@ -124,7 +124,9 @@ class DfsStem(nn.Module):
         self.norm        = nn.LayerNorm(D)
         # Temporal PE for T_dfs=28 frames
         self.temporal_pe = nn.Embedding(T_dfs, D)
-        self.recv_embed  = nn.Embedding(3, D)
+        # FiLM receiver conditioning: scale×h + shift (same as AmpStem)
+        self.recv_scale  = nn.Embedding(3, D)
+        self.recv_shift  = nn.Embedding(3, D)
 
         self._init_weights()
 
@@ -133,7 +135,8 @@ class DfsStem(nn.Module):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             nn.init.zeros_(m.bias)
         nn.init.trunc_normal_(self.temporal_pe.weight, std=0.02)
-        nn.init.trunc_normal_(self.recv_embed.weight,  std=0.02)
+        nn.init.ones_(self.recv_scale.weight)    # identity scale at init
+        nn.init.zeros_(self.recv_shift.weight)   # zero shift at init
         nn.init.xavier_uniform_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
@@ -162,7 +165,9 @@ class DfsStem(nn.Module):
         positions = torch.arange(T2, device=h.device)
         h = h + self.temporal_pe(positions)                           # [B,28,D]+[28,D]
 
-        # 6. Receiver embedding
-        h = h + self.recv_embed.weight[rx_id]                         # [B,28,D]+[D]
+        # 6. FiLM receiver modulation
+        scale = self.recv_scale.weight[rx_id]     # [D]
+        shift = self.recv_shift.weight[rx_id]     # [D]
+        h = h * scale + shift                     # [B, T_dfs, D] broadcasts with [D]
 
         return h   # [B, T_dfs, D]

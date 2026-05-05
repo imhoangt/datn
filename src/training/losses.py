@@ -1,6 +1,6 @@
 """
 src/training/losses.py  +  src/training/trainer.py
-Loss functions and training loop for CHARM-Net v6.6.
+Loss functions and training loop for CHARM-Net v7.1.
 """
 
 from __future__ import annotations
@@ -62,11 +62,14 @@ def compute_loss(
     y_act  = y_8class.clamp(0, 5)                   # [B]
 
     # ── L_main: label smoothing ε=0.05 + per-sample class weighting ──────
+    # FIX-M5: use logit_unified via F.log_softmax (numerically stable log-sum-exp)
+    logit_unified = outputs['logit_unified']             # [B, 8]
     eps  = cfg.get('label_smoothing', 0.05)
-    n_cl = P.shape[-1]
+    n_cl = logit_unified.shape[-1]
     soft = (1 - eps) * F.one_hot(y_8class, n_cl).float() + eps / n_cl
     w    = class_weights[y_8class]
-    L_main = ((-(soft * torch.log(P.clamp(min=1e-8))).sum(-1)) * w).mean()
+    log_probs_main = F.log_softmax(logit_unified, dim=-1)
+    L_main = ((-(soft * log_probs_main).sum(-1)) * w).mean()
 
     # ── L_occ: BCE all samples ─────────────────────────────────────────
     L_occ = F.binary_cross_entropy(p_occ.squeeze(1), y_occ.squeeze(1))
