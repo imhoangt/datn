@@ -4,9 +4,12 @@ Preprocessing pipeline for XRF55 dataset (Intel 5300, 30 subs, ~200Hz).
 
 Directory structure:
     data/raw/xrf55/
-        rx_01/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
-        rx_02/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
-        rx_03/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
+        rx_01/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+        rx_02/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+        rx_03/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+
+Filename example: 01_39_01.dat → volunteer=01, activity_id=39, rep=01
+activity_id is the numeric XRF55 class index (see XRF55_CLASS_ID_MAP).
 
 Each .dat file: Intel 5300 binary (10-bit packed), single receiver site.
 Per-file output: [T=1000, F=30, A=3] complex64 at ~200Hz.
@@ -82,7 +85,8 @@ def scan_xrf55_dataset(
     """
     Scan XRF55 directory for matched triples (rx_01/rx_02/rx_03).
 
-    Filename convention: {class_id}_{volunteer_id}_{rep}.dat
+    Filename convention: {volunteer_id}_{activity_id}_{rep}.dat  (e.g. 01_39_01.dat)
+    activity_id is at parts[1], not parts[0].
     Raises:
         FileNotFoundError: if rx_01 directory doesn't exist
     """
@@ -108,15 +112,16 @@ def scan_xrf55_dataset(
                 continue
 
             try:
-                class_id_raw = int(parts[0])
-                rep          = parts[2]
+                # Filename: {volunteer_id}_{activity_id}_{rep}.dat → activity at parts[1]
+                activity_id_raw = int(parts[1])
+                rep             = parts[2]
             except (ValueError, IndexError):
-                logger.warning(f"Cannot parse class/rep from: {dat_file.name}")
+                logger.warning(f"Cannot parse activity_id/rep from: {dat_file.name}")
                 continue
 
-            label_int = class_id_map.get(class_id_raw)
+            label_int = class_id_map.get(activity_id_raw)
             if label_int is None:
-                logger.debug(f"Unmapped class_id {class_id_raw} in {dat_file.name}")
+                logger.debug(f"Unmapped activity_id {activity_id_raw} in {dat_file.name}")
                 continue
 
             # Find matching files in rx_02, rx_03
@@ -137,9 +142,9 @@ def scan_xrf55_dataset(
                 activity_label     = class_names[label_int],
                 activity_label_int = label_int,
                 metadata           = {
-                    'rx_files': [str(dat_file), str(rx02_file), str(rx03_file)],
-                    'class_id_raw': class_id_raw,
-                    'rep': rep,
+                    'rx_files'      : [str(dat_file), str(rx02_file), str(rx03_file)],
+                    'activity_id_raw': activity_id_raw,
+                    'rep'           : rep,
                 },
             )
             recordings.append(rec)
@@ -147,8 +152,9 @@ def scan_xrf55_dataset(
     logger.info(f"XRF55: found {len(recordings)} matched recordings in {raw_dir}")
     if not recordings:
         logger.error(
-            f"No recordings found. Check directory structure: "
-            f"{raw_dir}/rx_01/{{volunteer}}/{{class_id}}_{{vol}}_{{rep}}.dat"
+            f"No recordings found. Expected: "
+            f"{raw_dir}/rx_01/{{vol}}/{{vol}}_{{activity_id}}_{{rep}}.dat  "
+            f"(e.g. rx_01/01/01_39_01.dat)"
         )
     return recordings
 

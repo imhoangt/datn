@@ -28,10 +28,11 @@ dataset:
   ant_strategy: pad_zeros
 
   # Directory structure:
-  # data/raw/xrf55/rx_01/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
-  # data/raw/xrf55/rx_02/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
-  # data/raw/xrf55/rx_03/{volunteer_id}/{class_id}_{volunteer_id}_{rep}.dat
-  # class_id is numeric XRF55 activity index (see class_id_map below)
+  # data/raw/xrf55/rx_01/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+  # data/raw/xrf55/rx_02/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+  # data/raw/xrf55/rx_03/{volunteer_id}/{volunteer_id}_{activity_id}_{rep}.dat
+  # Example: rx_01/01/01_39_01.dat  → volunteer=01, activity_id=39, rep=01
+  # activity_id is numeric XRF55 activity index (see class_id_map below)
 
   # XRF55 numeric activity ID → our 8-class label (verify with dataset doc)
   class_id_map:
