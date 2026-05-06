@@ -175,10 +175,11 @@ def run_loso(
     from src.datasets.base_dataset import build_loaders
     from src.training.losses import train_one_epoch, evaluate_with_ema
     from src.models.heads import TemperatureScaler
-    from src.evaluation.metrics import compute_fold_metrics
+    from src.evaluation.metrics import compute_fold_metrics, CLASS_NAMES
 
-    cfg_tr = cfg.get('training', {})
-    cfg_m  = cfg.get('model', {})
+    cfg_tr      = cfg.get('training', {})
+    cfg_m       = cfg.get('model', {})
+    class_names = cfg.get('dataset', {}).get('class_names', CLASS_NAMES)
 
     class_weights = torch.tensor(
         cfg_tr.get('class_weights', [1.,1.,1.,1.,1.,2.,1.5,3.]),
@@ -301,8 +302,8 @@ def run_loso(
         ts  = TemperatureScaler()
         ts.calibrate(model, val_loader, device)
 
-        _, test_probs, test_labels = evaluate_with_ema(model, ema, test_loader, device)
-        fold_metrics = compute_fold_metrics(test_probs, test_labels)
+        _, test_probs, test_labels = evaluate_with_ema(model, ema, test_loader, device, ts)
+        fold_metrics = compute_fold_metrics(test_probs, test_labels, class_names=class_names)
         fold_metrics['best_val_f1']  = best_val_f1
         fold_metrics['temperature']  = ts.temperature.item()
         all_fold_results[fold_id]    = fold_metrics

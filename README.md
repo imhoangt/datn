@@ -1,4 +1,4 @@
-# CHARM-Net v7.1 — WiFi CSI Human Activity Recognition
+# CHARM-Net v7.2 — WiFi CSI Human Activity Recognition
 
 **CHARM-Net**: Channel, Hardware, Activity Recognition Multi-stream Network
 Đồ án tốt nghiệp — WiFi CSI HAR (Single-person, 8 classes, 3 datasets)
@@ -265,7 +265,7 @@ I      Write HDF5 (train: 4× data, val/test: original only)
 | Phase | Epochs | LR range | aug_level | EMA decay |
 |---|---|---|---|---|
 | 1 Warmup | 5 | 1e-5 → 1e-4 (linear) | no_aug | 0.999 |
-| 2 Main cosine | 50 | 1e-4 → 1e-6 | full (+ CutMix-Time) | 0.999 |
+| 2 Main cosine | 50 | 1e-4 → 1e-6 | full | 0.999 |
 | 3 Fine-tune | 20 | 1e-5 → 1e-7 | no_aug | 0.9999 |
 
 Post-training: Temperature scaling calibration on validation set (LBFGS).
@@ -282,7 +282,7 @@ Post-training: Temperature scaling calibration on validation set (LBFGS).
 | ReceiverContextFusion gate init=0 | Safe warm-start: tanh(0)=0, no effect at epoch 0 |
 | head_unified + F.log_softmax | Numerically stable L_main; avoids log(softmax(x)) double approximation |
 | Blocked 5-fold for expose_csi | Single volunteer → no LOSO; chronological split prevents temporal leakage |
-| CutMix-Time on-the-fly (batch-level) | Must be applied after DataLoader to pair different samples; offline aug is per-sample |
+| Offline augmentation only (E+H stage) | CutMix removed: mixing only amp (not DFS) and no label mixing produced incorrect gradients |
 
 ---
 

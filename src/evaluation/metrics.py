@@ -92,8 +92,9 @@ def _compute_ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 10) -> flo
     correct  = (preds == labels).astype(float)
     bins     = np.linspace(0, 1, n_bins + 1)
     ece      = 0.0
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (confs >= lo) & (confs < hi)
+    for idx, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+        is_last = (idx == n_bins - 1)
+        mask    = (confs >= lo) & (confs <= hi if is_last else confs < hi)
         if mask.sum() > 0:
             avg_conf = confs[mask].mean()
             avg_acc  = correct[mask].mean()

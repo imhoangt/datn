@@ -1,6 +1,6 @@
 """
 src/models/charm_net.py
-CHARMNet v7.0: Channel, Hardware, Activity Recognition Multi-stream Network
+CHARMNet v7.2: Channel, Hardware, Activity Recognition Multi-stream Network
 
 Architecture:
     Per-RX (shared weights):
@@ -13,7 +13,7 @@ Architecture:
     DualScaleReadout(Z_global) → z [B,D]
     HierarchicalHeads(z) → p_8class [B,8], logit_unified [B,8]
 
-Design notes (v7.0):
+Design notes (v7.2):
     - F_sub and A are configurable for multi-dataset support
     - All datasets normalized to F_sub=52, A=4 in preprocessing
     - drop_path_rate passed to both encoders (FIX-T3)
@@ -34,7 +34,7 @@ from .heads    import HierarchicalHeads, TemperatureScaler
 
 class CHARMNet(nn.Module):
     """
-    Full CHARM-Net v7.0.
+    Full CHARM-Net v7.2.
 
     Input shapes:
         X_amp: [B, T=350, F=52, M=3, A=4]  amplitude features (float32)
@@ -192,7 +192,7 @@ def build_model(cfg: dict, device: torch.device) -> CHARMNet:
 
     # Print parameter counts
     counts = model.param_count()
-    print("[CHARMNet v7.0] Parameter counts:")
+    print("[CHARMNet v7.2] Parameter counts:")
     for name, n in counts.items():
         print(f"  {name:20s}: {n:>8,}")
 

@@ -1,6 +1,6 @@
 """
 src/training/losses.py  +  src/training/trainer.py
-Loss functions and training loop for CHARM-Net v7.1.
+Loss functions and training loop for CHARM-Net v7.2.
 """
 
 from __future__ import annotations
@@ -55,14 +55,27 @@ def compute_loss(
     p_act      = outputs['p_act']             # [B, 6]
     z_per_recv = outputs['z_per_recv']        # [B, 3, D]
 
+    B      = y_8class.shape[0]
     device = P.device
 
-    y_occ  = (y_8class != 7).float().unsqueeze(1)   # [B, 1]
-    y_dyn  = (y_8class  < 6).float().unsqueeze(1)   # [B, 1]
-    y_act  = y_8class.clamp(0, 5)                   # [B]
+    # ── Dataset-specific auxiliary loss hierarchy ──────────────────────
+    aux_cfg   = cfg.get('aux_loss', {})
+    use_occ   = aux_cfg.get('use_occ', True)
+    use_dyn   = aux_cfg.get('use_dyn', True)
+    use_act   = aux_cfg.get('use_act', True)
+    empty_idx = aux_cfg.get('empty_class_idx', 7)
+    dyn_max   = aux_cfg.get('dynamic_class_max_idx', 5)
+    n_act     = aux_cfg.get('n_act_classes', 6)
+
+    if use_occ and empty_idx is not None:
+        y_occ = (y_8class != empty_idx).float().unsqueeze(1)
+    else:
+        y_occ = torch.ones(B, 1, device=device)
+
+    y_dyn = (y_8class <= dyn_max).float().unsqueeze(1)
+    y_act = y_8class.clamp(0, n_act - 1)
 
     # ── L_main: label smoothing ε=0.05 + per-sample class weighting ──────
-    # FIX-M5: use logit_unified via F.log_softmax (numerically stable log-sum-exp)
     logit_unified = outputs['logit_unified']             # [B, 8]
     eps  = cfg.get('label_smoothing', 0.05)
     n_cl = logit_unified.shape[-1]
@@ -72,22 +85,28 @@ def compute_loss(
     L_main = ((-(soft * log_probs_main).sum(-1)) * w).mean()
 
     # ── L_occ: BCE all samples ─────────────────────────────────────────
-    L_occ = F.binary_cross_entropy(p_occ.squeeze(1), y_occ.squeeze(1))
+    if use_occ:
+        L_occ = F.binary_cross_entropy(p_occ.squeeze(1), y_occ.squeeze(1))
+    else:
+        L_occ = torch.tensor(0.0, device=device)
 
     # ── L_dyn: BCE occupied only ───────────────────────────────────────
     occ_mask = y_occ.squeeze(1).bool()
-    if occ_mask.any():
+    if use_dyn and occ_mask.any():
         L_dyn = F.binary_cross_entropy(
             p_dyn[occ_mask].squeeze(1), y_dyn[occ_mask].squeeze(1)
         )
     else:
         L_dyn = torch.tensor(0.0, device=device)
 
-    # ── L_act: Focal γ=2, dynamic only (classes 0..5) ──────────────────
-    dyn_mask = (y_8class < 6)
-    if dyn_mask.any():
-        L_act = focal_loss(p_act[dyn_mask], y_act[dyn_mask],
-                           gamma=cfg.get('focal_gamma', 2.0))
+    # ── L_act: Focal γ=2, dynamic only ────────────────────────────────
+    if use_act:
+        dyn_mask = y_8class <= dyn_max
+        if dyn_mask.any():
+            L_act = focal_loss(p_act[dyn_mask], y_act[dyn_mask],
+                               gamma=cfg.get('focal_gamma', 2.0))
+        else:
+            L_act = torch.tensor(0.0, device=device)
     else:
         L_act = torch.tensor(0.0, device=device)
 
@@ -118,45 +137,6 @@ def compute_loss(
 # trainer.py
 # ============================================================================
 
-def get_paired_batch(
-    batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> Tuple:
-    """Shuffle within batch for H1b CutMix paired samples."""
-    X_amp, X_dfs, labels = batch
-    j = torch.randperm(X_amp.size(0), device=X_amp.device)
-    return X_amp, X_dfs, labels, X_amp[j], X_dfs[j], labels[j]
-
-
-def apply_cutmix_time(
-    X_amp       : torch.Tensor,
-    X_amp_j     : torch.Tensor,
-    global_epoch: int,
-    cfg         : dict,
-) -> torch.Tensor:
-    """
-    H1b CutMix-Time: replace a random time segment with paired sample.
-    Applied in training loop AFTER DataLoader, using get_paired_batch.
-    FIX v6.6 BUG#56: applied here (training loop), NOT inside Dataset.
-
-    X_amp:   [B, T=350, F=52, M=3, A=4]
-    X_amp_j: [B, T=350, F=52, M=3, A=4]  (shuffled batch)
-    """
-    start_ep   = cfg.get('cutmix_start_epoch', 8)
-    prob       = cfg.get('cutmix_prob', 0.3)
-    max_ratio  = cfg.get('cutmix_max_ratio', 0.2)
-
-    if global_epoch < start_ep:
-        return X_amp
-
-    T = X_amp.shape[1]
-    X_out = X_amp.clone()
-    for b in range(X_amp.size(0)):
-        if np.random.rand() < prob:
-            cut_len = int(np.random.randint(1, max(2, int(T * max_ratio) + 1)))
-            t1      = int(np.random.randint(0, T - cut_len))
-            X_out[b, t1:t1 + cut_len] = X_amp_j[b, t1:t1 + cut_len]
-    return X_out
-
 
 def train_one_epoch(
     model        : nn.Module,
@@ -182,16 +162,10 @@ def train_one_epoch(
     n_batches = 0
 
     for i, batch in enumerate(loader):
-        # Paired batch for H1b CutMix
-        X_amp, X_dfs, labels, X_amp_j, _, _ = get_paired_batch(batch)
+        X_amp, X_dfs, labels = batch
         X_amp  = X_amp.to(device, non_blocking=True)
         X_dfs  = X_dfs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        X_amp_j = X_amp_j.to(device, non_blocking=True)
-
-        # H1b CutMix-Time (FIX v6.6 BUG#56)
-        if aug_level == 'full':
-            X_amp = apply_cutmix_time(X_amp, X_amp_j, global_epoch, cfg)
 
         with torch.autocast(device_type=device.type):
             out  = model(X_amp, X_dfs)
@@ -226,13 +200,16 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate_with_ema(
-    model  : nn.Module,
+    model              : nn.Module,
     ema,
     loader,
-    device : torch.device,
+    device             : torch.device,
+    temperature_scaler = None,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
     """
-    Evaluate model using EMA weights (FIX v6.5).
+    Evaluate model using EMA weights.
+    If temperature_scaler is provided, applies temperature scaling to logit_unified
+    instead of using raw p_8class — use this for final test evaluation after calibration.
     Returns: macro_f1, all_probs [N,8], all_labels [N]
     """
     from sklearn.metrics import f1_score
@@ -243,7 +220,11 @@ def evaluate_with_ema(
     with ema.average_parameters():
         for X_amp, X_dfs, labels in loader:
             out = model(X_amp.to(device), X_dfs.to(device))
-            all_probs.append(out['p_8class'].cpu().numpy())
+            if temperature_scaler is not None:
+                probs = temperature_scaler(out['logit_unified'])
+            else:
+                probs = out['p_8class']
+            all_probs.append(probs.cpu().numpy())
             all_labels.append(labels.numpy())
 
     probs  = np.concatenate(all_probs)    # [N, 8]

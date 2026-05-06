@@ -9,7 +9,7 @@ Class hierarchy:
     lying_still(6) = P(occ) × (1 - P(dynamic|occ))
     actions(0-5)   = P(occ) × P(action_k|dyn,occ)
 
-Design notes (v7.0):
+Design notes (v7.2):
 - head_unified = Linear(D, 8): exact logits for numerically stable L_main (FIX-M5)
 - p_8class = softmax(logit_unified): proper probability vector for inference
 - Factored heads (occ/dyn/act) kept as auxiliary supervision only
@@ -102,7 +102,7 @@ class TemperatureScaler(nn.Module):
     """
     Post-hoc temperature scaling calibration [Guo et al., ICML 2017].
 
-    v7.0: Uses logit_unified directly (exact logits) instead of log(p_8class)
+    v7.2: Uses logit_unified directly (exact logits) instead of log(p_8class)
     approximation. LBFGS on val set (held out from training).
     """
 

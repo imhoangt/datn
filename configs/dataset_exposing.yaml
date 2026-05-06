@@ -57,8 +57,14 @@ dataset:
   class_ids: [0, 1, 2, 3, 4, 5, 6, 7]
 
 # Class weights: empty=3.0 (imbalanced), others uniform
+# Only L_occ is valid: class 7=empty. class 6=clap is dynamic → disable L_dyn/L_act.
 training:
   class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0]
+  aux_loss:
+    use_occ: true
+    empty_class_idx: 7   # class 7 = empty
+    use_dyn: false       # class 6=clap is dynamic, no clear static class
+    use_act: false       # no clean 6-class action subset
 
 # Blocked chronological 5-fold (single volunteer, no LOSO possible)
 # Each activity's ~66 windows split into 5 contiguous time blocks.

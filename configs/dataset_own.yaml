@@ -51,6 +51,16 @@ dataset:
   #     {activity}_rep{rep:02d}_rx{0,1,2}.pcap
   # Example: person_P0/room_01/setup_01/trajectory_Tr0/walk_rep00_rx0.pcap
 
+# Auxiliary loss hierarchy (own dataset class structure)
+training:
+  aux_loss:
+    use_occ: true
+    empty_class_idx: 7        # class 7 = empty_room
+    use_dyn: true
+    dynamic_class_max_idx: 5  # 0..5 dynamic; 6=lay_still (static); 7=empty
+    use_act: true
+    n_act_classes: 6
+
 # Override evaluation for 8-person LOSO
 evaluation:
   n_folds: 8

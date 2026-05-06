@@ -61,8 +61,13 @@ model:
   F_sub: 30
 
 # Class weights: fall=2.0 (safety-critical), bend_to_pick=1.5 (hard posture)
+# XRF55 has no empty/static class — disable all auxiliary losses
 training:
   class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 1.0]
+  aux_loss:
+    use_occ: false   # no empty class in XRF55 (class 7 = clap)
+    use_dyn: false   # all 8 classes are dynamic
+    use_act: false   # 8 dynamic classes but head_act expects 6
 
 # LOSO over 8 subjects (matching own-data protocol)
 evaluation:
