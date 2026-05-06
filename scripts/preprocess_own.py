@@ -1,5 +1,5 @@
 """
-scripts/preprocess_own.py — Run full v6.6 pipeline on own-collected data.
+scripts/preprocess_own.py — Run full v7.2 pipeline on own-collected data.
 """
 import sys, argparse, logging
 from pathlib import Path

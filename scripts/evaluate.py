@@ -31,10 +31,12 @@ def main():
 
     from scripts.train import load_config, set_seed
     from src.models.charm_net import build_model
-    from src.datasets.base_dataset import build_loaders
+    from src.datasets.base_dataset import build_loaders, CHARMDataset
     from src.training.loso_runner import load_checkpoint
     from src.training.losses import evaluate_with_ema
-    from src.evaluation.metrics import compute_fold_metrics
+    from src.evaluation.metrics import compute_fold_metrics, CLASS_NAMES
+    from src.models.heads import TemperatureScaler
+    from torch.utils.data import DataLoader
 
     try:
         from torch_ema import ExponentialMovingAverage
@@ -50,6 +52,7 @@ def main():
     out_dir       = Path(args.output)
     ckpt_dir      = out_dir / 'checkpoints'
     fig_dir       = out_dir / 'figures'
+    class_names   = cfg.get('dataset', {}).get('class_names', CLASS_NAMES)
 
     n_folds = cfg.get('evaluation', {}).get('n_folds', 8)
     folds   = list(range(n_folds)) if args.fold == 'all' else [int(args.fold)]
@@ -73,13 +76,20 @@ def main():
         ema   = ExponentialMovingAverage(model.parameters(), decay=0.999)
         load_checkpoint(str(ckpt), model, ema, device=device)
 
-        _, probs, labels = evaluate_with_ema(model, ema, test_loader, device)
-        metrics = compute_fold_metrics(probs, labels)
+        # Calibrate temperature scaler on val set (consistent with loso_runner.py)
+        val_ds     = CHARMDataset(str(hdf5), 'val')
+        val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=2)
+        ts = TemperatureScaler()
+        ts.calibrate(model, val_loader, device)
+        logger.info(f"  Fold {fold_id} temperature: {ts.temperature.item():.4f}")
+
+        _, probs, labels = evaluate_with_ema(model, ema, test_loader, device, ts)
+        metrics = compute_fold_metrics(probs, labels, class_names=class_names)
         all_results[fold_id] = metrics
 
         logger.info(
             f"Fold {fold_id}: macro_f1={metrics['macro_f1']:.4f} "
-            f"fall_recall={metrics['fall_recall']:.4f}"
+            f"fall_recall={metrics.get('fall_recall', 0):.4f}"
         )
 
         if args.plot:
@@ -87,6 +97,7 @@ def main():
             cm = np.array(metrics['confusion_matrix'])
             plot_confusion_matrix(
                 cm, str(fig_dir / f"{args.dataset}_fold{fold_id:02d}_cm.png"),
+                class_names=class_names,
                 title=f'{args.dataset} Fold {fold_id} Confusion Matrix',
             )
 

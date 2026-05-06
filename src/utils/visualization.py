@@ -129,7 +129,8 @@ def plot_training_curves(
     train_df = df[df['phase'] == 'train']
     if 'total' in train_df.columns:
         axes[0].plot(train_df['epoch'], train_df['total'], label='Total')
-        axes[0].plot(train_df['epoch'], train_df.get('L_main', 0), label='L_main', linestyle='--')
+        if 'L_main' in train_df.columns:
+            axes[0].plot(train_df['epoch'], train_df['L_main'], label='L_main', linestyle='--')
         axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
         axes[0].set_title(f'Training Loss (fold {fold_id})')
         axes[0].legend(); axes[0].grid(True, alpha=0.3)

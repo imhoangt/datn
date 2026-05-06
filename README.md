@@ -197,7 +197,7 @@ DATN/
 │   │   ├── fusion.py              CrossModal, ReceiverContext, ReceiverFusion
 │   │   ├── readout.py             DualScaleReadout (fast+slow)
 │   │   ├── heads.py               HierarchicalHeads, TemperatureScaler
-│   │   └── charm_net.py           CHARMNet v7.1 + build_model()
+│   │   └── charm_net.py           CHARMNet v7.2 + build_model()
 │   ├── preprocessing/
 │   │   ├── common.py              AGC, Hampel, PCHIP, sliding window, stats
 │   │   ├── pipeline_own.py        Own-data pipeline
@@ -240,7 +240,7 @@ DATN/
 
 ---
 
-## Pipeline v7.1 — Các bước chính
+## Pipeline v7.2 — Các bước chính
 
 ```
 A1-A4  Parse raw file → validate → select subcarriers → detect gaps

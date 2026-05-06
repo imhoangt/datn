@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import random
 import sys
 from pathlib import Path
@@ -34,10 +33,12 @@ def set_seed(seed: int):
 
 def load_config(dataset: str) -> dict:
     root    = Path(__file__).parent.parent
-    base    = yaml.safe_load(open(root / 'configs' / 'base.yaml'))
+    with open(root / 'configs' / 'base.yaml') as f:
+        base = yaml.safe_load(f)
     ds_path = root / 'configs' / f'dataset_{dataset}.yaml'
     if ds_path.exists():
-        ds_cfg = yaml.safe_load(open(ds_path))
+        with open(ds_path) as f:
+            ds_cfg = yaml.safe_load(f)
         # Deep merge dataset config over base
         def _merge(base, override):
             for k, v in override.items():
@@ -50,7 +51,7 @@ def load_config(dataset: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='CHARM-Net v6.6 Training')
+    parser = argparse.ArgumentParser(description='CHARM-Net v7.2 Training')
     parser.add_argument('--dataset', choices=['own', 'xrf55', 'exposing'], required=True)
     parser.add_argument('--fold',    default='all',
                         help='Fold id (0-7) or "all" for full LOSO')
@@ -101,14 +102,6 @@ def main():
     from src.training.loso_runner import run_loso
 
     n_folds = cfg.get('evaluation', {}).get('n_folds', 8)
-    if args.fold != 'all':
-        folds = [int(args.fold)]
-    else:
-        folds = list(range(n_folds))
-
-    # Patch n_folds if running subset
-    if args.fold != 'all':
-        n_folds = 1
 
     summary = run_loso(
         cfg          = cfg,
@@ -121,11 +114,17 @@ def main():
     )
 
     if summary:
-        logger.info(
-            f"\n[FINAL] {args.dataset} "
-            f"Macro F1 = {summary['mean_macro_f1']*100:.2f}% "
-            f"± {summary['std_macro_f1']*100:.2f}%"
-        )
+        if 'mean_macro_f1' in summary:
+            logger.info(
+                f"\n[FINAL] {args.dataset} "
+                f"Macro F1 = {summary['mean_macro_f1']*100:.2f}% "
+                f"± {summary['std_macro_f1']*100:.2f}%"
+            )
+        else:
+            logger.info(
+                f"\n[FINAL] {args.dataset} fold {args.fold} "
+                f"Macro F1 = {summary['macro_f1']*100:.2f}%"
+            )
 
 
 if __name__ == '__main__':

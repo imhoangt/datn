@@ -2,9 +2,8 @@
 src/datasets/base_dataset.py
 Base PyTorch Dataset that reads from HDF5 files produced by pipeline_*.py.
 
-v6.7: H1a/H2 augmentation is done offline during preprocessing and stored in
-HDF5.  H1b CutMix-Time remains on-the-fly in the training loop (batch-level).
-No on-the-fly augmentation is applied here.
+All augmentation (E-stage + H1a/H2) is done offline during preprocessing and
+stored in HDF5. No on-the-fly augmentation is applied here.
 
 src/datasets/own_dataset.py   → thin wrappers calling CHARMDataset
 src/datasets/xrf55_dataset.py
@@ -27,13 +26,11 @@ class CHARMDataset(Dataset):
 
     Returns: (X_amp [350,52,3,4], X_dfs [28,128,3], label)
 
-    v6.7: all per-window augmentations (E-stage + H1a/H2) are stored in HDF5.
-    H1b CutMix-Time is applied in the training loop (batch-level, not here).
+    All augmentations (E-stage + H1a/H2) are stored in HDF5 at preprocessing time.
 
     Args:
-        hdf5_path   : path to fold_XX.h5
-        split       : 'train' | 'val' | 'test'
-        global_epoch: shared int (set externally before each epoch) for CutMix gate
+        hdf5_path: path to fold_XX.h5
+        split    : 'train' | 'val' | 'test'
     """
 
     def __init__(
@@ -43,9 +40,8 @@ class CHARMDataset(Dataset):
     ):
         super().__init__()
         assert split in ('train', 'val', 'test')
-        self.hdf5_path    = hdf5_path
-        self.split        = split
-        self.global_epoch = 0   # set externally per epoch
+        self.hdf5_path = hdf5_path
+        self.split     = split
 
         # Load metadata only (data loaded lazily per __getitem__)
         with h5py.File(hdf5_path, 'r') as f:
@@ -94,14 +90,11 @@ def build_loaders(
     hdf5_path    : str,
     batch_size   : int = 16,
     num_workers  : int = 4,
-    cfg_aug      : Optional[dict] = None,   # kept for API compat; unused since v6.7
     class_weights: Optional[torch.Tensor] = None,
 ) -> Tuple:
-    """
-    Build train/val/test DataLoaders from a fold HDF5.
+    """Build train/val/test DataLoaders from a fold HDF5.
 
     WeightedRandomSampler on train for class imbalance.
-    persistent_workers=False so global_epoch is visible to workers.
     """
     from torch.utils.data import DataLoader, WeightedRandomSampler
 
@@ -126,7 +119,7 @@ def build_loaders(
         num_workers       = num_workers,
         pin_memory        = True,
         drop_last         = True,
-        persistent_workers= False,  # False so global_epoch visible
+        persistent_workers= False,
     )
     val_loader = DataLoader(
         val_ds,

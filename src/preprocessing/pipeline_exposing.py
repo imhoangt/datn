@@ -206,7 +206,7 @@ def _write_hdf5_exposing_blocked(
 
     T_window  = cfg_pre.get('T_window', 350)
     stride    = cfg_pre.get('stride', 175)
-    n_classes = len(all_recs)   # 1 rec per activity → n_classes = 8
+    n_classes = 8
 
     split_windows: Dict[str, List] = {'train': [], 'val': [], 'test': []}
 

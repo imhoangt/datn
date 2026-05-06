@@ -204,7 +204,7 @@ def generate_mock_dataset_hdf5(
 
         f.attrs.update({
             'fold_id': fold_id, 'dataset': 'mock', 'protocol': 'LOSO_person',
-            'pipeline_version': 'v6.6', 'fs': 350, 'n_subcarriers': 52,
+            'pipeline_version': 'v7.2', 'fs': 350, 'n_subcarriers': 52,
             'n_classes': n_classes,
         })
 

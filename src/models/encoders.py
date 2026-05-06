@@ -4,7 +4,7 @@ DilatedConvTransformerBlock (DCT-Block): Pre-LN, dilated depthwise conv + self-a
 AmpEncoder: 2× DCT-Block (k=7, d=[2,4]) with gradient checkpointing
 DfsEncoder: 2× DCT-Block (k=5, d=[1,2]) with gradient checkpointing
 
-Design notes (v7.0):
+Design notes (v7.2):
 - Pre-LN for training stability [Xiong et al., ICML 2020]
 - PE injected upstream (Stem); blocks add no internal PE
 - Gradient checkpointing on ALL blocks, only during training [v6.4]

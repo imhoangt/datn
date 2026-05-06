@@ -120,31 +120,6 @@ def hampel_detect(
     return abs_dev > k * 1.4826 * mad_roll
 
 
-def _fill_boundary_nan(
-    result      : np.ndarray,
-    valid_values: np.ndarray,
-    good_idx    : np.ndarray,
-    bad_idx     : np.ndarray,
-) -> np.ndarray:
-    """
-    Fill NaN values at boundaries of interpolated array with nearest valid value.
-    Uses boolean masks (FIX v6.3) — not packet indices as array indices.
-
-    result:       [len(bad_idx)]  — interpolated, may contain NaN at boundaries
-    valid_values: [len(good_idx)] — values at good positions
-    good_idx, bad_idx: index arrays into the ORIGINAL track
-    """
-    if not np.isnan(result).any():
-        return result
-    before = bad_idx < good_idx[0]
-    after  = bad_idx > good_idx[-1]
-    if before.any():
-        result[before] = valid_values[0]
-    if after.any():
-        result[after]  = valid_values[-1]
-    return result
-
-
 def hampel_repair_complex(
     H_fma   : np.ndarray,
     bad_idx : np.ndarray,
@@ -296,19 +271,6 @@ def align_rx_timestamps(
 # ---------------------------------------------------------------------------
 # B4 — PCHIP Resampling onto Common Time Grid
 # ---------------------------------------------------------------------------
-def _fill_boundary_1d(arr: np.ndarray) -> np.ndarray:
-    """Fill NaN at start/end of 1-D array with nearest valid value (in-place)."""
-    mask = ~np.isnan(arr)
-    if not mask.any():
-        arr[:] = 0.0
-        return arr
-    fv = int(np.where(mask)[0][0])
-    lv = int(np.where(mask)[0][-1])
-    arr[:fv]   = arr[fv]
-    arr[lv+1:] = arr[lv]
-    return arr
-
-
 def pchip_resample_rx(
     H_clean_rx  : np.ndarray,
     timestamps_rx: np.ndarray,
@@ -856,68 +818,6 @@ def augment_joint(
                  ).astype(np.complex64)
 
     return H
-
-
-def augment_amp(
-    X_amp       : np.ndarray,
-    X_amp_j     : Optional[np.ndarray],
-    global_epoch: int,
-    cfg         : dict,
-) -> np.ndarray:
-    """
-    Branch α augmentation (H1a subcarrier masking, H1b CutMix-Time).
-    Applied after F4.
-
-    X_amp:   [T=350, F, M=3, A=4] float32
-    X_amp_j: paired sample for CutMix, same shape (or None)
-    """
-    # H1a: Subcarrier masking
-    p_mask     = cfg.get('subcarrier_mask_prob', 0.4)
-    mask_min   = cfg.get('subcarrier_mask_min', 3)
-    mask_max   = cfg.get('subcarrier_mask_max', 9)
-    if np.random.rand() < p_mask:
-        n_mask  = int(np.random.randint(mask_min, mask_max + 1))
-        f_start = int(np.random.randint(0, X_amp.shape[1] - n_mask))
-        X_amp = X_amp.copy()
-        X_amp[:, f_start:f_start + n_mask, :, :] = 0.0
-
-    # H1b: CutMix-Time (epoch >= cutmix_start, prob=cutmix_prob)
-    cutmix_start = cfg.get('cutmix_start_epoch', 8)
-    cutmix_prob  = cfg.get('cutmix_prob', 0.3)
-    cutmix_ratio = cfg.get('cutmix_max_ratio', 0.2)
-    if (global_epoch >= cutmix_start
-            and X_amp_j is not None
-            and np.random.rand() < cutmix_prob):
-        T       = X_amp.shape[0]
-        cut_len = int(np.random.randint(1, int(T * cutmix_ratio) + 1))
-        t1      = int(np.random.randint(0, T - cut_len))
-        X_amp   = X_amp.copy()
-        X_amp[t1:t1 + cut_len] = X_amp_j[t1:t1 + cut_len]
-
-    return X_amp
-
-
-def augment_dfs(X_dfs: np.ndarray, cfg: dict) -> np.ndarray:
-    """
-    Branch β on-the-fly augmentation (H2a Doppler masking, H2b time masking).
-    Kept for backwards-compat; offline equivalent is augment_features_offline.
-    fill=0.0 = background level after G7 median-centering.
-    """
-    # H2a: Doppler-bin masking
-    if np.random.rand() < cfg.get('doppler_mask_prob', 0.3):
-        n_m = int(np.random.randint(2, 7))
-        v_s = int(np.random.randint(0, X_dfs.shape[1] - n_m))
-        X_dfs = X_dfs.copy()
-        X_dfs[:, v_s:v_s + n_m, :] = 0.0
-
-    # H2b: Time-frame masking
-    if np.random.rand() < cfg.get('time_mask_prob', 0.3):
-        t_m = int(np.random.randint(1, 4))
-        t_s = int(np.random.randint(0, X_dfs.shape[0] - t_m))
-        X_dfs = X_dfs.copy()
-        X_dfs[t_s:t_s + t_m, :, :] = 0.0
-
-    return X_dfs
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ src/models/stems.py
 AmpStem: joint F×A projection → D → inject TemporalPE + FiLM receiver conditioning
 DfsStem: 2D conv on spectrogram → project to D → inject TemporalPE + FiLM receiver conditioning
 
-Design notes (v7.1):
+Design notes (v7.2):
 - AmpStem: joint_proj Linear(F*A→D) replaces sequential ant_mlp+freq_proj (FIX-M1)
   Enables model to learn cross-(subcarrier, antenna) interactions
 - DfsStem: T_dfs=28, V_dfs=128 fixed by STFT params

@@ -261,6 +261,7 @@ def preprocess_xrf55_dataset(cfg: dict, fold_id: int) -> Optional[str]:
         train_recs, fold_id, stats_path,
         cfg_pre.get('T_window', 350),
         cfg_pre.get('stride', 175),
+        n_groups=cfg_pre.get('n_fisher_groups', 13),
     )
 
     n_aug_offline = cfg.get('training', {}).get('n_aug_offline', 3)

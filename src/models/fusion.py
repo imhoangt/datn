@@ -4,7 +4,7 @@ CrossModalFusion: gated cross-attention (Q=Z_amp, K/V=Z_dfs)
 ReceiverFusion:   learnable weighted sum of M receiver representations
 ReceiverContextFusion: lightweight cross-receiver context sharing
 
-Design notes (v7.0):
+Design notes (v7.2):
 - CrossModalFusion: self.norm_out is named module (FIX v6.0); gate init=-2.0
 - ReceiverFusion: weight_proj uses concat(mean,var) → Linear(D*M*2, M) (FIX-M2)
   Variance term makes alpha sensitive to locally noisy receivers

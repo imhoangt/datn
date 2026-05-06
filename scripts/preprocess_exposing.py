@@ -12,7 +12,7 @@ def main():
 
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--folds', nargs='+', type=int, default=list(range(3)))
+    p.add_argument('--folds', nargs='+', type=int, default=list(range(5)))
     args = p.parse_args()
 
     for fold_id in args.folds:

@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -122,14 +121,13 @@ class TrainLogger:
 
         # CSV
         if self._csv_writer is None:
-            fieldnames        = list(row.keys())
-            self._csv_writer  = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
+            fieldnames       = list(row.keys())
+            self._csv_writer = csv.DictWriter(
+                self._csv_file, fieldnames=fieldnames, extrasaction='ignore'
+            )
             self._csv_writer.writeheader()
-        try:
-            self._csv_writer.writerow(row)
-            self._csv_file.flush()
-        except ValueError:
-            pass   # new keys added mid-run
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
 
         # TensorBoard
         if self.writer:
@@ -204,7 +202,6 @@ def run_loso(
             str(hdf5_path),
             batch_size   = cfg_tr.get('batch_size', 16),
             num_workers  = 4,
-            cfg_aug      = cfg_tr,
             class_weights= class_weights,
         )
 
@@ -236,7 +233,6 @@ def run_loso(
             lr = lr_start + (lr_end - lr_start) * ep / max(warmup_ep - 1, 1)
             for pg in optimizer.param_groups:
                 pg['lr'] = lr
-            train_ds.global_epoch = global_epoch
             train_m = train_one_epoch(model, train_loader, optimizer, scaler,
                                       ema, global_epoch, class_weights, cfg_tr,
                                       device, aug_level='no_aug')
@@ -257,7 +253,6 @@ def run_loso(
                                    eta_min=cfg_tr.get('main_lr_end', 1e-6))
         for ep in range(cfg_tr.get('main_epochs', 50)):
             global_epoch += 1
-            train_ds.global_epoch = global_epoch
             train_m = train_one_epoch(model, train_loader, optimizer, scaler,
                                       ema, global_epoch, class_weights, cfg_tr,
                                       device, aug_level='full')
@@ -281,7 +276,6 @@ def run_loso(
                                       eta_min=cfg_tr.get('finetune_lr_end', 1e-7))
         for ep in range(cfg_tr.get('finetune_epochs', 20)):
             global_epoch += 1
-            train_ds.global_epoch = global_epoch
             train_m = train_one_epoch(model, train_loader, optimizer, scaler,
                                       ema, global_epoch, class_weights, cfg_tr,
                                       device, aug_level='no_aug')
@@ -316,22 +310,33 @@ def run_loso(
         )
 
     # Summary
-    if all_fold_results:
-        f1s  = [r['macro_f1']   for r in all_fold_results.values()]
-        frs  = [r.get('fall_recall', 0) for r in all_fold_results.values()]
-        summary = {
-            'mean_macro_f1' : float(np.mean(f1s)),
-            'std_macro_f1'  : float(np.std(f1s)),
-            'mean_fall_recall': float(np.mean(frs)),
-            'per_fold'      : all_fold_results,
-        }
-        summary_path = Path(out_dir) / f"{dataset_name}_loso_summary.json"
-        with open(summary_path, 'w') as fp:
-            json.dump(summary, fp, indent=2, default=lambda x: float(x))
-        logger.info(
-            f"\n[{dataset_name}] LOSO result: "
-            f"macro_f1 = {summary['mean_macro_f1']:.4f} ± {summary['std_macro_f1']:.4f}"
-        )
-        return summary
+    if not all_fold_results:
+        return {}
 
-    return {}
+    if len(all_fold_results) == 1:
+        # Single-fold run: save per-fold file to avoid overwriting full LOSO results
+        k = next(iter(all_fold_results))
+        result_path = Path(out_dir) / f"{dataset_name}_fold{k}_result.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, 'w') as fp:
+            json.dump(all_fold_results[k], fp, indent=2, default=lambda x: float(x))
+        logger.info(f"\n[{dataset_name}] Fold {k} result saved: {result_path}")
+        return all_fold_results[k]
+
+    f1s  = [r['macro_f1']   for r in all_fold_results.values()]
+    frs  = [r.get('fall_recall', 0) for r in all_fold_results.values()]
+    summary = {
+        'mean_macro_f1'   : float(np.mean(f1s)),
+        'std_macro_f1'    : float(np.std(f1s)),
+        'mean_fall_recall': float(np.mean(frs)),
+        'per_fold'        : all_fold_results,
+    }
+    summary_path = Path(out_dir) / f"{dataset_name}_loso_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, 'w') as fp:
+        json.dump(summary, fp, indent=2, default=lambda x: float(x))
+    logger.info(
+        f"\n[{dataset_name}] LOSO result: "
+        f"macro_f1 = {summary['mean_macro_f1']:.4f} ± {summary['std_macro_f1']:.4f}"
+    )
+    return summary
