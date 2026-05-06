@@ -121,6 +121,9 @@ training:
   time_mask_prob_offline: 0.60         # H2b — time masking after freq
 
   # ── H1b CutMix-Time (on-the-fly, batch-level, training loop only) ────────
+  # Intentionally NOT baked offline: CutMix requires pairing two different
+  # samples within a batch, and gating depends on the current epoch number.
+  # Both constraints make offline baking impractical.
   cutmix_start_epoch: 8  # gate: after warmup + 3 main epochs
   cutmix_prob: 0.3
   cutmix_max_ratio: 0.2  # max 20% = 70/350 time steps per cut

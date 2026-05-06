@@ -48,6 +48,7 @@ from .parsers.nexmon_parser import (
     parse_nexmon_pcap,
     validate_and_clean_packets,
     select_subcarriers_bcm4366c0,
+    detect_ipi_gaps,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,8 +100,17 @@ def preprocess_one_recording(
         # A3: Subcarrier selection (64→52)
         H_sub = select_subcarriers_bcm4366c0(H_raw)   # [T, 52, 4]
 
-        # A4: IPI gap detection (flags stored but repair happens in B4 via PCHIP)
-        # Gap flag mask is used implicitly by PCHIP interpolation filling gaps
+        # A4: IPI gap detection — reject if any gap > 100ms
+        # PCHIP would interpolate through long gaps producing spurious signal.
+        large_gap, _ = detect_ipi_gaps(
+            timestamps,
+            duration_s,
+            fs_nominal   = cfg_pre.get('fs_out', 350.0),
+            large_gap_ms = cfg_pre.get('gap_large_ms', 100.0),
+        )
+        if large_gap.any():
+            logger.warning(f"[{rec_id}] RX{rx_idx}: large IPI gap detected, rejecting")
+            return None
 
         # B1: AGC normalization
         H_norm, _ = agc_normalize(H_sub)              # [T, 52, 4]
@@ -403,7 +413,7 @@ def preprocess_own_dataset(
         n_groups         = cfg_pre.get('n_fisher_groups', 13),
     )
 
-    # 6. Feature extraction and HDF5 write (v6.7: offline augmentation)
+    # 6. Feature extraction and HDF5 write
     n_aug_offline = cfg_tr.get('n_aug_offline', 3)
     _write_hdf5(
         out_path      = str(out_path),
@@ -414,6 +424,7 @@ def preprocess_own_dataset(
         cfg_pre       = cfg_pre,
         fold_id       = fold_id,
         dataset_name  = 'own',
+        protocol      = 'LOSO_person',
         n_aug_offline = n_aug_offline,
         cfg_aug       = cfg_tr,
     )
@@ -422,47 +433,45 @@ def preprocess_own_dataset(
     return str(out_path)
 
 
-def _write_hdf5(
+def _write_hdf5_core(
     out_path     : str,
-    train_recs   : List[Recording],
-    val_recs     : List[Recording],
-    test_recs    : List[Recording],
+    split_windows: Dict[str, List],
     stats        : dict,
     cfg_pre      : dict,
     fold_id      : int,
     dataset_name : str,
+    protocol     : str = 'LOSO_person',
     n_aug_offline: int = 0,
     cfg_aug      : Optional[dict] = None,
 ):
     """
-    Write preprocessed windows to HDF5.  v6.7 — offline augmentation support.
+    Core HDF5 writer shared by all dataset pipelines.
 
-    Train split  : generates (1 original + n_aug_offline augmented) copies per
-                   window.  Each augmented copy applies the full two-stage
-                   pipeline:  E-stage aug → feature extraction → H-stage aug.
-    Val / Test   : original only (n_aug_offline ignored).
-
-    Memory strategy — incremental resizable HDF5 datasets + write buffer:
-        • No large numpy stack in RAM; buffer holds FLUSH_EVERY samples at once.
-        • Buffer ≈ 512 × 0.87 MB ≈ 448 MB peak RAM (acceptable).
-        • resize() on chunk-per-sample datasets touches only HDF5 metadata.
-
-    New metadata fields vs. v6.6:
-        aug_copy_id  int8   0 = original, 1..n_aug = augmented copy index
-        orig_win_idx int32  sequential index of the originating window
+    split_windows[split] = list of 7-tuples:
+        (win_H [T,F,M,A] complex64, label_int, ref_idx,
+         rec_id, person_id, room_id, win_orig_idx)
+    win_orig_idx: window index within its recording (for RNG seeding).
+    X_dfs shape is inferred from the first train window (not hardcoded).
     """
     cfg_aug  = cfg_aug or {}
     T_window = cfg_pre.get('T_window', 350)
-    stride   = cfg_pre.get('stride', 175)
-    F_sub    = len(stats['fisher_scores'])   # dataset-agnostic (52 or 30)
+    F_sub    = len(stats['fisher_scores'])
 
-    FLUSH_EVERY = 512    # samples per HDF5 write (balances RAM vs. resize calls)
+    FLUSH_EVERY = 512
 
-    split_configs = [
-        ('train', train_recs, n_aug_offline),
-        ('val',   val_recs,   0),
-        ('test',  test_recs,  0),
-    ]
+    # Probe X_amp / X_dfs shapes from first train window
+    train_entries = split_windows.get('train', [])
+    if train_entries:
+        first_win_H, _, first_ref, *_ = train_entries[0]
+        X_amp_probe = process_amp_branch(first_win_H, stats)
+        X_dfs_probe = process_dfs_branch(first_win_H, stats, first_ref)
+        _, _, M_rx, A    = X_amp_probe.shape      # e.g. 3, 4
+        T_dfs, V_dfs, _  = X_dfs_probe.shape      # e.g. 28, 128
+    else:
+        M_rx  = cfg_pre.get('n_receivers', 3)
+        A     = cfg_pre.get('n_antennas', 4)
+        T_dfs = cfg_pre.get('T_dfs', 28)
+        V_dfs = cfg_pre.get('V_dfs', 128)
 
     split_counts: dict = {}
 
@@ -476,26 +485,28 @@ def _write_hdf5(
             else:
                 stats_grp.attrs[k] = v
 
-        # ── Per-split processing ────────────────────────────────────────────
-        for split_name, recs, n_aug in split_configs:
+        for split_name, entries, n_aug in [
+            ('train', split_windows.get('train', []), n_aug_offline),
+            ('val',   split_windows.get('val',   []), 0),
+            ('test',  split_windows.get('test',  []), 0),
+        ]:
             grp = f.create_group(split_name)
 
-            # Resizable datasets — chunk = 1 sample for DataLoader random access
             ds_amp = grp.create_dataset(
                 'X_amp',
-                shape=(0, T_window, F_sub, 3, 4),
-                maxshape=(None, T_window, F_sub, 3, 4),
+                shape=(0, T_window, F_sub, M_rx, A),
+                maxshape=(None, T_window, F_sub, M_rx, A),
                 dtype=np.float32,
                 compression='gzip', compression_opts=4,
-                chunks=(1, T_window, F_sub, 3, 4),
+                chunks=(1, T_window, F_sub, M_rx, A),
             )
             ds_dfs = grp.create_dataset(
                 'X_dfs',
-                shape=(0, 28, 128, 3),
-                maxshape=(None, 28, 128, 3),
+                shape=(0, T_dfs, V_dfs, M_rx),
+                maxshape=(None, T_dfs, V_dfs, M_rx),
                 dtype=np.float32,
                 compression='gzip', compression_opts=4,
-                chunks=(1, 28, 128, 3),
+                chunks=(1, T_dfs, V_dfs, M_rx),
             )
             ds_lbl = grp.create_dataset(
                 'labels', shape=(0,), maxshape=(None,), dtype=np.int8,
@@ -503,30 +514,27 @@ def _write_hdf5(
 
             meta_grp = grp.create_group('metadata')
 
-            # ── Write-buffer state ──────────────────────────────────────────
             buf_amp: List[np.ndarray] = []
             buf_dfs: List[np.ndarray] = []
             buf_lbl: List[int]        = []
             write_cursor = 0
 
-            # Metadata accumulated in lists (small; strings + ints)
             m_rec_ids: List[str] = []
             m_per_ids: List[str] = []
             m_rom_ids: List[str] = []
             m_win_ids: List[int] = []
             m_ref_ids: List[int] = []
-            m_aug_id : List[int] = []   # new v6.7
-            m_orig_wi: List[int] = []   # new v6.7
+            m_aug_id : List[int] = []
+            m_orig_wi: List[int] = []
 
-            n_rejected   = 0
-            orig_win_ctr = 0   # monotonic counter of original windows seen
+            n_rejected = 0
 
             def _flush() -> None:
                 nonlocal write_cursor
                 if not buf_amp:
                     return
-                n_new    = len(buf_amp)
-                new_end  = write_cursor + n_new
+                n_new   = len(buf_amp)
+                new_end = write_cursor + n_new
                 ds_amp.resize(new_end, axis=0)
                 ds_dfs.resize(new_end, axis=0)
                 ds_lbl.resize(new_end, axis=0)
@@ -536,106 +544,83 @@ def _write_hdf5(
                 write_cursor += n_new
                 buf_amp.clear(); buf_dfs.clear(); buf_lbl.clear()
 
-            # ── Window extraction + augmentation ───────────────────────────
-            for rec in tqdm(recs, desc=f'  [{split_name}]', leave=False):
-                ref_idx  = rec.metadata['ref_antenna_idx']
-                raw_wins = build_windows(rec, T=T_window, stride=stride)
+            for global_idx, entry in enumerate(
+                tqdm(entries, desc=f'  [{split_name}]', leave=False)
+            ):
+                win_H, label_int, ref_idx, rec_id, person_id, room_id, win_orig_idx = entry
+                seed = _window_seed(rec_id, win_orig_idx)
 
-                for win_idx, win_H in enumerate(raw_wins):
-                    seed = _window_seed(rec.recording_id, win_idx)
+                X_amp_o = process_amp_branch(win_H, stats)
+                X_dfs_o = process_dfs_branch(win_H, stats, ref_idx)
 
-                    # ── Copy 0: original (no augmentation) ─────────────────
-                    X_amp_o = process_amp_branch(win_H, stats)
-                    X_dfs_o = process_dfs_branch(win_H, stats, ref_idx)
+                if (X_amp_o.shape != (T_window, F_sub, M_rx, A)
+                        or X_dfs_o.shape != (T_dfs, V_dfs, M_rx)
+                        or np.any(np.isnan(X_amp_o))
+                        or np.any(np.isnan(X_dfs_o))):
+                    n_rejected += 1
+                    continue
 
-                    # Reject window if NaN or wrong shape
-                    if (X_amp_o.shape != (T_window, F_sub, 3, 4)
-                            or X_dfs_o.shape != (28, 128, 3)
-                            or np.any(np.isnan(X_amp_o))
-                            or np.any(np.isnan(X_dfs_o))):
-                        n_rejected += 1
-                        orig_win_ctr += 1
-                        continue
+                buf_amp.append(X_amp_o); buf_dfs.append(X_dfs_o)
+                buf_lbl.append(label_int)
+                m_rec_ids.append(rec_id)
+                m_per_ids.append(person_id)
+                m_rom_ids.append(room_id)
+                m_win_ids.append(win_orig_idx)
+                m_ref_ids.append(ref_idx)
+                m_aug_id.append(0)
+                m_orig_wi.append(global_idx)
 
-                    buf_amp.append(X_amp_o); buf_dfs.append(X_dfs_o)
-                    buf_lbl.append(rec.activity_label_int)
-                    m_rec_ids.append(rec.recording_id)
-                    m_per_ids.append(rec.person_id)
-                    m_rom_ids.append(rec.room_id)
-                    m_win_ids.append(win_idx)
+                for cid in range(1, n_aug + 1):
+                    win_H_aug = augment_joint_offline(win_H, ref_idx, cid, seed)
+                    X_amp_a   = process_amp_branch(win_H_aug, stats)
+                    X_dfs_a   = process_dfs_branch(win_H_aug, stats, ref_idx)
+
+                    if np.any(np.isnan(X_amp_a)) or np.any(np.isnan(X_dfs_a)):
+                        X_amp_a = X_amp_o.copy()
+                        X_dfs_a = X_dfs_o.copy()
+
+                    X_amp_a, X_dfs_a = augment_features_offline(
+                        X_amp_a, X_dfs_a, cid, seed, cfg_aug,
+                    )
+
+                    buf_amp.append(X_amp_a); buf_dfs.append(X_dfs_a)
+                    buf_lbl.append(label_int)
+                    m_rec_ids.append(rec_id)
+                    m_per_ids.append(person_id)
+                    m_rom_ids.append(room_id)
+                    m_win_ids.append(win_orig_idx)
                     m_ref_ids.append(ref_idx)
-                    m_aug_id.append(0)
-                    m_orig_wi.append(orig_win_ctr)
+                    m_aug_id.append(cid)
+                    m_orig_wi.append(global_idx)
 
-                    # ── Copies 1..n_aug: offline augmented ──────────────────
-                    for cid in range(1, n_aug + 1):
-                        # E-stage: augment raw complex CSI
-                        win_H_aug = augment_joint_offline(win_H, ref_idx, cid, seed)
+                if len(buf_amp) >= FLUSH_EVERY:
+                    _flush()
 
-                        # Feature extraction on augmented CSI
-                        X_amp_a = process_amp_branch(win_H_aug, stats)
-                        X_dfs_a = process_dfs_branch(win_H_aug, stats, ref_idx)
-
-                        # Fallback: if E-stage produced NaN, use original CSI
-                        if np.any(np.isnan(X_amp_a)) or np.any(np.isnan(X_dfs_a)):
-                            X_amp_a = X_amp_o.copy()
-                            X_dfs_a = X_dfs_o.copy()
-
-                        # H-stage: augment extracted features
-                        X_amp_a, X_dfs_a = augment_features_offline(
-                            X_amp_a, X_dfs_a, cid, seed, cfg_aug,
-                        )
-
-                        buf_amp.append(X_amp_a); buf_dfs.append(X_dfs_a)
-                        buf_lbl.append(rec.activity_label_int)
-                        m_rec_ids.append(rec.recording_id)
-                        m_per_ids.append(rec.person_id)
-                        m_rom_ids.append(rec.room_id)
-                        m_win_ids.append(win_idx)
-                        m_ref_ids.append(ref_idx)
-                        m_aug_id.append(cid)
-                        m_orig_wi.append(orig_win_ctr)
-
-                    orig_win_ctr += 1
-
-                    if len(buf_amp) >= FLUSH_EVERY:
-                        _flush()
-
-            _flush()   # final flush
+            _flush()
 
             if n_rejected:
                 logger.warning(
-                    f"[{split_name}] skipped {n_rejected} windows "
-                    f"(NaN/shape mismatch)"
+                    f"[{split_name}] skipped {n_rejected} windows (NaN/shape mismatch)"
                 )
 
-            # ── Write metadata (fits in RAM: strings + ints) ────────────────
             N  = write_cursor
             dt = h5py.string_dtype()
             if N > 0:
-                meta_grp.create_dataset(
-                    'recording_ids', dtype=dt,
+                meta_grp.create_dataset('recording_ids', dtype=dt,
                     data=np.array(m_rec_ids, dtype=object))
-                meta_grp.create_dataset(
-                    'person_ids', dtype=dt,
+                meta_grp.create_dataset('person_ids', dtype=dt,
                     data=np.array(m_per_ids, dtype=object))
-                meta_grp.create_dataset(
-                    'room_ids', dtype=dt,
+                meta_grp.create_dataset('room_ids', dtype=dt,
                     data=np.array(m_rom_ids, dtype=object))
-                meta_grp.create_dataset(
-                    'window_indices',
+                meta_grp.create_dataset('window_indices',
                     data=np.array(m_win_ids, dtype=np.int32))
-                meta_grp.create_dataset(
-                    'ref_antenna_idxs',
+                meta_grp.create_dataset('ref_antenna_idxs',
                     data=np.array(m_ref_ids, dtype=np.int8))
-                meta_grp.create_dataset(       # v6.7
-                    'aug_copy_id',
+                meta_grp.create_dataset('aug_copy_id',
                     data=np.array(m_aug_id, dtype=np.int8))
-                meta_grp.create_dataset(       # v6.7
-                    'orig_win_idx',
+                meta_grp.create_dataset('orig_win_idx',
                     data=np.array(m_orig_wi, dtype=np.int32))
             else:
-                # Empty split — create placeholder datasets for consistent schema
                 for name in ('recording_ids', 'person_ids', 'room_ids'):
                     meta_grp.create_dataset(name, shape=(0,), dtype=dt)
                 for name in ('window_indices', 'orig_win_idx'):
@@ -643,18 +628,16 @@ def _write_hdf5(
                 meta_grp.create_dataset('ref_antenna_idxs', shape=(0,), dtype=np.int8)
                 meta_grp.create_dataset('aug_copy_id',       shape=(0,), dtype=np.int8)
 
-            n_orig_wins = orig_win_ctr - n_rejected
             split_counts[split_name] = N
+            n_orig = len(entries) - n_rejected
             logger.info(
-                f"  [{split_name}] {N:,} samples "
-                f"({n_orig_wins:,} orig × {1 + n_aug} copies)"
+                f"  [{split_name}] {N:,} samples ({n_orig:,} orig × {1 + n_aug} copies)"
             )
 
-        # ── Global HDF5 attributes ──────────────────────────────────────────
         f.attrs['fold_id']          = fold_id
         f.attrs['dataset']          = dataset_name
-        f.attrs['protocol']         = 'LOSO_person'
-        f.attrs['pipeline_version'] = 'v6.7'
+        f.attrs['protocol']         = protocol
+        f.attrs['pipeline_version'] = 'v7.2'
         f.attrs['fs']               = 350
         f.attrs['n_subcarriers']    = F_sub
         f.attrs['n_classes']        = 8
@@ -662,3 +645,52 @@ def _write_hdf5(
         f.attrs['n_train']          = split_counts.get('train', 0)
         f.attrs['n_val']            = split_counts.get('val',   0)
         f.attrs['n_test']           = split_counts.get('test',  0)
+
+
+def _write_hdf5(
+    out_path     : str,
+    train_recs   : List[Recording],
+    val_recs     : List[Recording],
+    test_recs    : List[Recording],
+    stats        : dict,
+    cfg_pre      : dict,
+    fold_id      : int,
+    dataset_name : str,
+    protocol     : str = 'LOSO_person',
+    n_aug_offline: int = 0,
+    cfg_aug      : Optional[dict] = None,
+):
+    """Assemble split_windows from Recording objects, then call _write_hdf5_core."""
+    T_window = cfg_pre.get('T_window', 350)
+    stride   = cfg_pre.get('stride', 175)
+
+    split_windows: Dict[str, List] = {'train': [], 'val': [], 'test': []}
+    for split_name, recs in [
+        ('train', train_recs), ('val', val_recs), ('test', test_recs)
+    ]:
+        for rec in recs:
+            ref_idx = rec.metadata['ref_antenna_idx']
+            for win_idx, win_H in enumerate(
+                build_windows(rec, T=T_window, stride=stride)
+            ):
+                split_windows[split_name].append((
+                    win_H,
+                    rec.activity_label_int,
+                    ref_idx,
+                    rec.recording_id,
+                    rec.person_id,
+                    rec.room_id,
+                    win_idx,
+                ))
+
+    _write_hdf5_core(
+        out_path=out_path,
+        split_windows=split_windows,
+        stats=stats,
+        cfg_pre=cfg_pre,
+        fold_id=fold_id,
+        dataset_name=dataset_name,
+        protocol=protocol,
+        n_aug_offline=n_aug_offline,
+        cfg_aug=cfg_aug,
+    )

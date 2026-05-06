@@ -16,8 +16,9 @@ Class mapping (activity code letter → our 8-class label):
     A=walk, B=run, C=jump, D=sit_still, K=squat, I=lay_down, H=clap, E=empty
 
 Protocol: blocked chronological 5-fold (single volunteer, no LOSO possible).
-Each activity's windows are split into 5 contiguous time blocks.
-fold_id = test block; remaining 4 blocks = train.
+For each activity recording (~66 windows), windows are split into 5 contiguous
+time blocks. fold_id: test=block[fold_id], val=block[(fold_id-1)%5], train=rest.
+All 8 activities appear in every split (class-complete by construction).
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ from .common import (
     hampel_repair_rx,
     pchip_resample_rx,
     select_ref_antenna,
-    fit_preprocessing_stats,
+    build_windows,
+    fit_preprocessing_stats_from_windows,
 )
 from .parsers.axcsi_parser import (
     load_axcsi_file,
@@ -61,7 +63,6 @@ EXPOSING_CLASS_NAMES = [
     'walk', 'run', 'jump', 'sit_still', 'squat', 'lay_down', 'clap', 'empty'
 ]
 
-# Receiver file prefix per receiver site
 _RX_PREFIX = {0: 'S7a', 1: 'S7b', 2: 'S7c'}
 _RX_DIR    = {0: 'rx_01', 1: 'rx_02', 2: 'rx_03'}
 
@@ -115,12 +116,12 @@ def scan_exposing_dataset(
 
         rec = Recording(
             recording_id       = f'expose_{code}',
-            person_id          = 'volunteer_01',   # single volunteer dataset
+            person_id          = 'volunteer_01',
             room_id            = 'expose_csi',
             activity_label     = class_names[label_int],
             activity_label_int = label_int,
             metadata           = {
-                'rx_files'    : [str(mat_file), str(rx02_file), str(rx03_file)],
+                'rx_files'     : [str(mat_file), str(rx02_file), str(rx03_file)],
                 'activity_code': code,
             },
         )
@@ -178,50 +179,114 @@ def preprocess_exposing_recording(
     return np.stack(H_uni_list, axis=2)   # [T_out, 52, M=3, A=4]
 
 
-def _blocked_5fold_split(
-    recordings: List[Recording],
+def _write_hdf5_exposing_blocked(
+    out_path  : str,
+    all_recs  : List[Recording],
     fold_id   : int,
-    n_folds   : int = 5,
-) -> Tuple[List[Recording], List[Recording], List[Recording]]:
+    n_folds   : int,
+    cfg_pre   : dict,
+    stats_path: str,
+    n_aug     : int,
+    cfg_aug   : dict,
+) -> None:
     """
-    Blocked chronological 5-fold split for single-volunteer dataset.
+    Blocked 5-fold HDF5 writer for Exposing CSI (window-level split).
 
-    Each recording covers one full activity (~80s, ~66 windows after sliding window).
-    Since there is exactly 1 recording per activity, we split the recordings list
-    into 5 contiguous blocks in time-order and use fold_id as the test block.
+    For each recording (one per activity, ~66 windows after sliding window):
+        blocks = np.array_split(windows, n_folds)  # 5 contiguous time blocks
+        test  += blocks[fold_id]           from ALL activities
+        val   += blocks[(fold_id-1)%5]     from ALL activities
+        train += remaining 3 blocks        from ALL activities
 
-    Returns: (train_recs, val_recs, test_recs)
-    val_recs = block immediately before test block (or last block if fold_id=0)
+    All 8 activities appear in every split (class-complete by construction).
+    Stats are fit ONLY on train windows (no val/test leakage).
+    Uses _write_hdf5_core — no duplicated HDF5 write logic.
     """
-    n = len(recordings)
-    if n == 0:
-        return [], [], []
+    from .pipeline_own import _write_hdf5_core
 
-    # Split indices into n_folds contiguous blocks
-    blocks = np.array_split(np.arange(n), n_folds)
-    test_idxs = set(blocks[fold_id].tolist())
-    val_block  = (fold_id - 1) % n_folds
-    val_idxs   = set(blocks[val_block].tolist())
+    T_window  = cfg_pre.get('T_window', 350)
+    stride    = cfg_pre.get('stride', 175)
+    n_classes = len(all_recs)   # 1 rec per activity → n_classes = 8
 
-    train_recs = [recordings[i] for i in range(n) if i not in test_idxs and i not in val_idxs]
-    val_recs   = [recordings[i] for i in val_idxs]
-    test_recs  = [recordings[i] for i in test_idxs]
+    split_windows: Dict[str, List] = {'train': [], 'val': [], 'test': []}
+
+    for rec in all_recs:
+        ref_idx = rec.metadata['ref_antenna_idx']
+        windows = list(build_windows(rec, T=T_window, stride=stride))
+        if not windows:
+            logger.warning(f"No windows for {rec.recording_id}, skipping")
+            continue
+
+        blocks    = np.array_split(np.arange(len(windows)), n_folds)
+        test_idxs = set(blocks[fold_id].tolist())
+        val_idxs  = set(blocks[(fold_id - 1) % n_folds].tolist())
+
+        for i, win_H in enumerate(windows):
+            entry = (
+                win_H,
+                rec.activity_label_int,
+                ref_idx,
+                rec.recording_id,
+                rec.person_id,
+                rec.room_id,
+                i,
+            )
+            if i in test_idxs:
+                split_windows['test'].append(entry)
+            elif i in val_idxs:
+                split_windows['val'].append(entry)
+            else:
+                split_windows['train'].append(entry)
+
+    # Class completeness assertion — every split must contain all 8 activities
+    for split_name, entries in split_windows.items():
+        labels_present = {label_int for _, label_int, *_ in entries}
+        expected       = set(range(n_classes))
+        assert labels_present == expected, (
+            f"Exposing CSI blocked split: '{split_name}' missing activities "
+            f"{expected - labels_present}. Check that all recordings have "
+            f"enough windows for {n_folds}-fold split."
+        )
+
+    # Fit stats on TRAIN windows only (no val/test leakage)
+    train_entries_for_stats = [
+        (win_H, label_int, ref_idx)
+        for win_H, label_int, ref_idx, *_ in split_windows['train']
+    ]
+    stats = fit_preprocessing_stats_from_windows(
+        train_entries=train_entries_for_stats,
+        fold_id=fold_id,
+        save_path=stats_path,
+        n_groups=cfg_pre.get('n_fisher_groups', 13),
+    )
+
+    _write_hdf5_core(
+        out_path=out_path,
+        split_windows=split_windows,
+        stats=stats,
+        cfg_pre=cfg_pre,
+        fold_id=fold_id,
+        dataset_name='exposing',
+        protocol='blocked_5fold',
+        n_aug_offline=n_aug,
+        cfg_aug=cfg_aug,
+    )
 
     logger.info(
-        f"Blocked 5-fold split (fold {fold_id}): "
-        f"train={len(train_recs)}, val={len(val_recs)}, test={len(test_recs)}"
+        f"Exposing CSI fold {fold_id}: "
+        f"train={len(split_windows['train'])}, "
+        f"val={len(split_windows['val'])}, "
+        f"test={len(split_windows['test'])} windows"
     )
-    return train_recs, val_recs, test_recs
 
 
 def preprocess_exposing_dataset(cfg: dict, fold_id: int) -> Optional[str]:
     """
     Main entry point for Exposing CSI preprocessing. Returns HDF5 path or None.
 
-    Uses blocked 5-fold chronological split (single volunteer).
+    Uses blocked 5-fold chronological split at window level (single volunteer).
+    Stats are fit on train windows only. All splits contain all 8 activities.
     """
-    from .pipeline_own import _write_hdf5
-
     cfg_ds  = cfg.get('dataset', {})
     cfg_pre = cfg.get('preprocessing', {})
 
@@ -258,21 +323,18 @@ def preprocess_exposing_dataset(cfg: dict, fold_id: int) -> Optional[str]:
     for rec in valid:
         rec.metadata['ref_antenna_idx'] = select_ref_antenna(rec.H_uniform)
 
-    train_recs, val_recs, test_recs = _blocked_5fold_split(valid, fold_id, n_folds)
-
-    stats_path = str(processed_dir / f"fold_{fold_id:02d}_stats.npz")
-    stats = fit_preprocessing_stats(
-        train_recs, fold_id, stats_path,
-        cfg_pre.get('T_window', 350),
-        cfg_pre.get('stride', 175),
-    )
-
+    stats_path    = str(processed_dir / f"fold_{fold_id:02d}_stats.npz")
     n_aug_offline = cfg.get('training', {}).get('n_aug_offline', 3)
-    _write_hdf5(
-        str(out_path), train_recs, val_recs, test_recs,
-        stats, cfg_pre, fold_id, 'exposing',
-        n_aug_offline=n_aug_offline,
-        cfg_aug=cfg.get('training', {}),
+
+    _write_hdf5_exposing_blocked(
+        out_path   = str(out_path),
+        all_recs   = valid,
+        fold_id    = fold_id,
+        n_folds    = n_folds,
+        cfg_pre    = cfg_pre,
+        stats_path = stats_path,
+        n_aug      = n_aug_offline,
+        cfg_aug    = cfg.get('training', {}),
     )
 
     logger.info(f"Exposing CSI fold {fold_id} saved: {out_path}")

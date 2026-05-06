@@ -267,6 +267,7 @@ def preprocess_xrf55_dataset(cfg: dict, fold_id: int) -> Optional[str]:
     _write_hdf5(
         str(out_path), train_recs, val_recs, test_recs,
         stats, cfg_pre, fold_id, 'xrf55',
+        protocol='LOSO_person',
         n_aug_offline=n_aug_offline,
         cfg_aug=cfg.get('training', {}),
     )

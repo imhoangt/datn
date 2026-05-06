@@ -48,8 +48,10 @@ X_amp [B, 350, 52, M=3, A=4]        X_dfs [B, 28, 128, M=3]
 | Dataset | Thiết bị | Receivers | Subcarriers | Rate | Protocol |
 |---|---|---|---|---|---|
 | own | BCM4366c0 / Nexmon CSI | 3 × ASUS RT-AC86U | 52 | 350Hz | LOSO 8-fold |
-| xrf55 | Intel 5300 / linux-80211n-csitool | 3 sites | 30 | ~200Hz | LOSO 8-fold |
-| expose_csi | Broadcom 43684 / AX-CSI (802.11ax) | 3 collectors | 52 (of 2048) | ~150Hz | Blocked 5-fold |
+| xrf55 | Intel 5300 / linux-80211n-csitool | 3 sites | 30 | ~200Hz → 350Hz* | LOSO 8-fold |
+| expose_csi | Broadcom 43684 / AX-CSI (802.11ax) | 3 collectors | 52 (of 2048) | ~150Hz → 350Hz* | Blocked 5-fold |
+
+> \* XRF55 (~200Hz) và Expose CSI (~150Hz) được PCHIP resample lên 350Hz để thống nhất input shape T=350 của model. Upsampling không tạo thêm thông tin vật lý — chỉ nội suy để đồng bộ kiến trúc với own dataset.
 
 ### Classes per dataset
 

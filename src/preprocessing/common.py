@@ -11,7 +11,8 @@ Contains:
   - pchip_resample_rx     B4  (vectorized boundary fill via shared NaN pattern)
   - select_ref_antenna    G1
   - bandpass_complex      G4
-  - fit_preprocessing_stats  Stats Pass 1 (Welford + Fisher, SINGLE PASS)
+  - fit_preprocessing_stats              Stats Pass 1 (Welford + Fisher, SINGLE PASS, from Recordings)
+  - fit_preprocessing_stats_from_windows Stats Pass 1 (same, from pre-built window list — Exposing CSI)
   - build_windows         Stage D
 
 All numpy, no torch.  Called from pipeline_*.py files.
@@ -575,6 +576,107 @@ def fit_preprocessing_stats(
     return stats
 
 
+def fit_preprocessing_stats_from_windows(
+    train_entries: List[Tuple[np.ndarray, int, int]],
+    fold_id      : int,
+    save_path    : str,
+    n_groups     : int = 13,
+) -> dict:
+    """
+    Welford Z-score + Fisher subcarrier selection from pre-built train windows.
+
+    Identical accumulation logic to fit_preprocessing_stats, but accepts raw
+    windows instead of Recording objects — required when the train/test split
+    happens at window level (e.g. Exposing CSI blocked 5-fold).
+
+    train_entries: list of (win_H [T, F, M, A] complex64, label_int, ref_idx)
+                   Only train windows — no val/test entries (prevents leakage).
+    """
+    if not train_entries:
+        logger.error("fit_preprocessing_stats_from_windows: no training entries")
+        return {}
+
+    first_win_H, _, _ = train_entries[0]
+    _, F, M, A = first_win_H.shape
+
+    n_total  = 0
+    mean_acc = np.zeros((F, M, A), dtype=np.float64)
+    M2_acc   = np.zeros((F, M, A), dtype=np.float64)
+
+    x_features: List[np.ndarray] = []
+    y_labels  : List[int]        = []
+
+    for win_H, label_int, ref_idx in train_entries:
+        T_win   = win_H.shape[0]
+        non_ref = [a for a in range(A) if a != ref_idx]
+
+        X_abs = np.abs(win_H).astype(np.float64)
+        X_lp  = _lowpass_stats(X_abs)
+        X_cen = X_lp - np.median(X_lp, axis=0, keepdims=True)
+
+        m        = T_win
+        b_mean   = X_cen.mean(axis=0)
+        b_M2     = X_cen.var(axis=0) * m
+        combined = n_total + m
+        delta    = b_mean - mean_acc
+        mean_acc = mean_acc + delta * (m / combined)
+        M2_acc   = M2_acc + b_M2 + delta**2 * (n_total * m / combined)
+        n_total  = combined
+
+        H_ref   = win_H[:, :, :, ref_idx]
+        H_other = win_H[:, :, :, non_ref]
+        C       = H_other * np.conj(H_ref[:, :, :, None])
+        C_dyn   = C - C.mean(axis=0, keepdims=True)
+        C_bp    = bandpass_complex(C_dyn)
+        x_wf    = np.abs(C_bp).var(axis=0).mean(axis=(1, 2))   # [F]
+
+        x_features.append(x_wf)
+        y_labels.append(label_int)
+
+    zscore_mu    = mean_acc.astype(np.float32)
+    zscore_sigma = (np.sqrt(M2_acc / n_total) + 1e-8).astype(np.float32)
+
+    x_mat     = np.stack(x_features)
+    y_arr     = np.array(y_labels)
+    mu_global = x_mat.mean(axis=0)
+
+    between_var = np.zeros(F, dtype=np.float64)
+    within_var  = np.zeros(F, dtype=np.float64)
+    for c in np.unique(y_arr):
+        mask = (y_arr == c)
+        n_c  = int(mask.sum())
+        x_c  = x_mat[mask]
+        mu_c = x_c.mean(axis=0)
+        between_var += n_c * (mu_c - mu_global) ** 2
+        within_var  += n_c * x_c.var(axis=0)
+
+    fisher_scores = between_var / (within_var + 1e-12)
+
+    sub_groups = np.array_split(np.arange(F), n_groups)
+    selected   = np.array(
+        [int(grp[np.argmax(fisher_scores[grp])]) for grp in sub_groups],
+        dtype=np.int32,
+    )
+
+    stats = {
+        'zscore_mu'            : zscore_mu,
+        'zscore_sigma'         : zscore_sigma,
+        'fisher_scores'        : fisher_scores.astype(np.float32),
+        'selected_subcarriers' : selected,
+        'fold_id'              : fold_id,
+        'n_timesteps'          : n_total,
+        'n_windows'            : len(train_entries),
+    }
+
+    np.savez(save_path, **stats)
+    logger.info(
+        f"[Fold {fold_id}] Stats fit (from_windows): {n_total:,} timesteps"
+        f" / {len(train_entries):,} windows | F={F}, groups={[len(g) for g in sub_groups]}"
+    )
+    logger.info(f"[Fold {fold_id}] Fisher-selected: {selected.tolist()}")
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # Stage D — Sliding Window
 # ---------------------------------------------------------------------------
@@ -876,24 +978,26 @@ def augment_joint_offline(
         elif sh < 0:
             H = np.concatenate([H[-sh:], H[-1:].repeat(-sh, axis=0)], axis=0)
 
-    # E6 (NEW): Per-antenna phase jitter (p=0.70)
+    # E6 (NEW): Per-(receiver, antenna) phase jitter (p=0.70)
     # Physical basis: oscillator drift is spectrally flat → same θ for all F subs,
-    # independent across antennas. Range ±π/4 keeps conjugate-mult coherent.
+    # but each (receiver, antenna) RF chain has its own independent drift.
     if rng.rand() < 0.70:
-        for a in range(A):
-            theta = rng.uniform(-np.pi / 4.0, np.pi / 4.0)
-            H[:, :, :, a] = (H[:, :, :, a] * np.exp(1j * theta)).astype(np.complex64)
+        for m in range(M):
+            for a in range(A):
+                theta = rng.uniform(-np.pi / 4.0, np.pi / 4.0)
+                H[:, :, m, a] = (H[:, :, m, a] * np.exp(1j * theta)).astype(np.complex64)
 
     # E2: Amplitude scale (p=0.90) — conservative [0.75,1.25] for transformer
     if rng.rand() < 0.90:
         H = H * np.float32(rng.uniform(0.75, 1.25))
 
-    # E3: Antenna dropout (p=0.40) — never drop reference antenna
+    # E3: Antenna dropout (p=0.40) — one (receiver, antenna) pair; never ref antenna
     if rng.rand() < 0.40:
         non_ref  = [a for a in range(A) if a != ref_antenna_idx]
+        drop_rx  = int(rng.randint(0, M))
         drop_ant = int(rng.choice(non_ref))
-        noise    = (rng.randn(T, F, M) + 1j * rng.randn(T, F, M))
-        H[:, :, :, drop_ant] = (noise * 0.01).astype(np.complex64)
+        noise    = (rng.randn(T, F) + 1j * rng.randn(T, F)).astype(np.complex64)
+        H[:, :, drop_rx, drop_ant] = (noise * 0.01).astype(np.complex64)
 
     # E4: Receiver dropout (p=0.15)
     if rng.rand() < 0.15:
